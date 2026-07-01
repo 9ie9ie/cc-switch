@@ -188,6 +188,7 @@ impl Database {
             request_model TEXT,
             pricing_model TEXT,
             input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+            reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
             cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
             input_token_semantics INTEGER NOT NULL DEFAULT 0,
             input_cost_usd TEXT NOT NULL DEFAULT '0', output_cost_usd TEXT NOT NULL DEFAULT '0',
@@ -274,6 +275,7 @@ impl Database {
                 success_count INTEGER NOT NULL DEFAULT 0,
                 input_tokens INTEGER NOT NULL DEFAULT 0,
                 output_tokens INTEGER NOT NULL DEFAULT 0,
+                reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
                 cache_read_tokens INTEGER NOT NULL DEFAULT 0,
                 cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
                 input_token_semantics INTEGER NOT NULL DEFAULT 0,
@@ -284,6 +286,10 @@ impl Database {
             [],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Keep user_version aligned with upstream v3.17.0 so the official build
+        // can still open this database. Extra columns are added idempotently.
+        Self::ensure_reasoning_output_token_columns(conn)?;
 
         // 18. Session Log Sync 表 (会话日志同步状态)
         conn.execute(
@@ -656,6 +662,7 @@ impl Database {
             request_id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, app_type TEXT NOT NULL, model TEXT NOT NULL,
             request_model TEXT,
             input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+            reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
             cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
             input_token_semantics INTEGER NOT NULL DEFAULT 0,
             input_cost_usd TEXT NOT NULL DEFAULT '0', output_cost_usd TEXT NOT NULL DEFAULT '0',
@@ -1348,6 +1355,26 @@ impl Database {
                 conn,
                 "usage_daily_rollups",
                 "input_token_semantics",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn ensure_reasoning_output_token_columns(conn: &Connection) -> Result<(), AppError> {
+        if Self::table_exists(conn, "proxy_request_logs")? {
+            Self::add_column_if_missing(
+                conn,
+                "proxy_request_logs",
+                "reasoning_output_tokens",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+        if Self::table_exists(conn, "usage_daily_rollups")? {
+            Self::add_column_if_missing(
+                conn,
+                "usage_daily_rollups",
+                "reasoning_output_tokens",
                 "INTEGER NOT NULL DEFAULT 0",
             )?;
         }
@@ -2750,6 +2777,36 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_columns_are_added_without_advancing_upstream_schema() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute(
+            "CREATE TABLE proxy_request_logs (request_id TEXT PRIMARY KEY)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE usage_daily_rollups (date TEXT PRIMARY KEY)",
+            [],
+        )?;
+        Database::set_user_version(&conn, 13)?;
+
+        Database::ensure_reasoning_output_token_columns(&conn)?;
+        Database::ensure_reasoning_output_token_columns(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, 13);
+        assert!(Database::has_column(
+            &conn,
+            "proxy_request_logs",
+            "reasoning_output_tokens"
+        )?);
+        assert!(Database::has_column(
+            &conn,
+            "usage_daily_rollups",
+            "reasoning_output_tokens"
+        )?);
+        Ok(())
+    }
 
     #[test]
     fn migrate_v12_to_v13_adds_input_token_semantics_columns() -> Result<(), AppError> {

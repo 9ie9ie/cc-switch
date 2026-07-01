@@ -125,7 +125,7 @@ impl Database {
             "INSERT OR REPLACE INTO usage_daily_rollups
                 (date, app_type, provider_id, model, request_model, pricing_model,
                  request_count, success_count,
-                 input_tokens, output_tokens,
+                 input_tokens, output_tokens, reasoning_output_tokens,
                  cache_read_tokens, cache_creation_tokens,
                  input_token_semantics, total_cost_usd, avg_latency_ms)
             SELECT
@@ -134,6 +134,7 @@ impl Database {
                 COALESCE(old.success_count, 0) + new_succ,
                 COALESCE({fresh_old_input}, 0) + new_in,
                 COALESCE(old.output_tokens, 0) + new_out,
+                COALESCE(old.reasoning_output_tokens, 0) + new_reasoning_out,
                 COALESCE(old.cache_read_tokens, 0) + new_cr,
                 COALESCE(old.cache_creation_tokens, 0) + new_cc,
                 {INPUT_TOKEN_SEMANTICS_FRESH},
@@ -153,6 +154,7 @@ impl Database {
                     SUM(CASE WHEN l.status_code >= 200 AND l.status_code < 300 THEN 1 ELSE 0 END) as new_succ,
                     COALESCE(SUM({fresh_detail_input}), 0) as new_in,
                     COALESCE(SUM(l.output_tokens), 0) as new_out,
+                    COALESCE(SUM(l.reasoning_output_tokens), 0) as new_reasoning_out,
                     COALESCE(SUM(l.cache_read_tokens), 0) as new_cr,
                     COALESCE(SUM(l.cache_creation_tokens), 0) as new_cc,
                     COALESCE(SUM(CAST(l.total_cost_usd AS REAL)), 0) as new_cost,
