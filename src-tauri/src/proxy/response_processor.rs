@@ -1002,6 +1002,7 @@ mod tests {
         let usage = TokenUsage {
             input_tokens: 1_000_000,
             output_tokens: 0,
+            reasoning_output_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             model: None,
@@ -1070,6 +1071,7 @@ mod tests {
         let usage = TokenUsage {
             input_tokens: 1_000_000,
             output_tokens: 0,
+            reasoning_output_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             model: None,
@@ -1152,6 +1154,7 @@ mod tests {
         let usage = TokenUsage {
             input_tokens: 1_000_000,
             output_tokens: 0,
+            reasoning_output_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             model: None,

@@ -188,6 +188,7 @@ impl Database {
             request_model TEXT,
             pricing_model TEXT,
             input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+            reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
             cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
             input_cost_usd TEXT NOT NULL DEFAULT '0', output_cost_usd TEXT NOT NULL DEFAULT '0',
             cache_read_cost_usd TEXT NOT NULL DEFAULT '0', cache_creation_cost_usd TEXT NOT NULL DEFAULT '0',
@@ -273,6 +274,7 @@ impl Database {
                 success_count INTEGER NOT NULL DEFAULT 0,
                 input_tokens INTEGER NOT NULL DEFAULT 0,
                 output_tokens INTEGER NOT NULL DEFAULT 0,
+                reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
                 cache_read_tokens INTEGER NOT NULL DEFAULT 0,
                 cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
                 total_cost_usd TEXT NOT NULL DEFAULT '0',
@@ -443,6 +445,11 @@ impl Database {
                         log::info!("迁移数据库从 v10 到 v11（usage_daily_rollups 保留 request_model 维度）");
                         Self::migrate_v10_to_v11(conn)?;
                         Self::set_user_version(conn, 11)?;
+                    }
+                    11 => {
+                        log::info!("迁移数据库从 v11 到 v12（记录 reasoning output tokens）");
+                        Self::migrate_v11_to_v12(conn)?;
+                        Self::set_user_version(conn, 12)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -1267,6 +1274,32 @@ impl Database {
         log::info!(
             "v10 -> v11 迁移完成：usage_daily_rollups 已保留 request_model/pricing_model 维度"
         );
+        Ok(())
+    }
+
+    /// v11 -> v12：记录 Codex/OpenAI reasoning output token 统计。
+    fn migrate_v11_to_v12(conn: &Connection) -> Result<(), AppError> {
+        if Self::table_exists(conn, "proxy_request_logs")? {
+            Self::add_column_if_missing(
+                conn,
+                "proxy_request_logs",
+                "reasoning_output_tokens",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+
+        if Self::table_exists(conn, "usage_daily_rollups")? {
+            Self::add_column_if_missing(
+                conn,
+                "usage_daily_rollups",
+                "reasoning_output_tokens",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+
+        Self::create_request_logs_usage_indexes_if_supported(conn)?;
+
+        log::info!("v11 -> v12 迁移完成：已添加 reasoning_output_tokens");
         Ok(())
     }
 
@@ -2492,6 +2525,7 @@ impl Database {
             "data_source",
             "input_tokens",
             "output_tokens",
+            "reasoning_output_tokens",
             "cache_read_tokens",
             "created_at",
             "cache_creation_tokens",
@@ -2511,8 +2545,9 @@ impl Database {
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_request_logs_dedup_lookup_expr
              ON proxy_request_logs(app_type, COALESCE(data_source, 'proxy'), input_tokens,
-                                   output_tokens, cache_read_tokens, created_at,
-                                   cache_creation_tokens)",
+                                    output_tokens, reasoning_output_tokens,
+                                    cache_read_tokens, created_at,
+                                    cache_creation_tokens)",
             [],
         )
         .map_err(|e| AppError::Database(format!("创建使用量去重表达式索引失败: {e}")))?;
