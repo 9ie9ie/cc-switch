@@ -4017,6 +4017,33 @@ mod tests {
             result.is_some(),
             "OpenAI 日期后缀模型应能回退到 gpt-5.5 基础定价"
         );
+        for (alias, expected) in [
+            (
+                "openai/gpt-5.6-sol:priority",
+                ("5", "30", "0.5", "6.25"),
+            ),
+            (
+                "OpenAI/GPT-5.6-Terra-2026-06-26",
+                ("2.5", "15", "0.25", "3.125"),
+            ),
+            (
+                "gpt-5.6-luna@xhigh",
+                ("1", "6", "0.1", "1.25"),
+            ),
+        ] {
+            let actual = find_model_pricing_row(&conn, alias)?
+                .unwrap_or_else(|| panic!("{alias} should resolve to GPT-5.6 pricing"));
+            assert_eq!(
+                actual,
+                (
+                    expected.0.to_string(),
+                    expected.1.to_string(),
+                    expected.2.to_string(),
+                    expected.3.to_string(),
+                ),
+                "{alias} should resolve to the expected GPT-5.6 price"
+            );
+        }
         let result = find_model_pricing_row(&conn, "google/gemini-3-pro-preview-20260514")?;
         assert!(
             result.is_some(),

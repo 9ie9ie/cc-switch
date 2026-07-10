@@ -728,6 +728,50 @@ fn schema_model_pricing_is_seeded_on_init() {
         gpt_count
     );
 
+    for (model_id, expected) in [
+        (
+            "gpt-5.6-sol",
+            ("GPT-5.6 Sol", "5", "30", "0.5", "6.25"),
+        ),
+        (
+            "gpt-5.6-terra",
+            ("GPT-5.6 Terra", "2.5", "15", "0.25", "3.125"),
+        ),
+        (
+            "gpt-5.6-luna",
+            ("GPT-5.6 Luna", "1", "6", "0.1", "1.25"),
+        ),
+    ] {
+        let actual: (String, String, String, String, String) = conn
+            .query_row(
+                "SELECT display_name, input_cost_per_million, output_cost_per_million,
+                        cache_read_cost_per_million, cache_creation_cost_per_million
+                 FROM model_pricing WHERE model_id = ?1",
+                [model_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("query GPT-5.6 price");
+        assert_eq!(
+            actual,
+            (
+                expected.0.to_string(),
+                expected.1.to_string(),
+                expected.2.to_string(),
+                expected.3.to_string(),
+                expected.4.to_string(),
+            ),
+            "{model_id} should use the official built-in price"
+        );
+    }
+
     // 验证包含 Gemini 模型
     let gemini_count: i64 = conn
         .query_row(
@@ -740,6 +784,68 @@ fn schema_model_pricing_is_seeded_on_init() {
         gemini_count > 0,
         "应该包含 Gemini 模型定价，实际数量: {}",
         gemini_count
+    );
+}
+
+#[test]
+fn model_pricing_seed_preserves_existing_gpt_5_6_user_price() {
+    let db = Database::memory().expect("create memory db");
+
+    {
+        let conn = db.conn.lock().expect("lock conn");
+        conn.execute(
+            "INSERT OR REPLACE INTO model_pricing (
+                model_id, display_name, input_cost_per_million, output_cost_per_million,
+                cache_read_cost_per_million, cache_creation_cost_per_million
+             ) VALUES ('gpt-5.6-sol', 'Custom GPT-5.6 Sol', '9', '99', '0.9', '9.9')",
+            [],
+        )
+        .expect("set custom GPT-5.6 Sol price");
+        conn.execute("DELETE FROM model_pricing WHERE model_id = 'gpt-5.6-terra'", [])
+            .expect("remove GPT-5.6 Terra price");
+    }
+
+    db.ensure_model_pricing_seeded()
+        .expect("ensure pricing seeded");
+
+    let conn = db.conn.lock().expect("lock conn");
+    let sol: (String, String, String, String, String) = conn
+        .query_row(
+            "SELECT display_name, input_cost_per_million, output_cost_per_million,
+                    cache_read_cost_per_million, cache_creation_cost_per_million
+             FROM model_pricing WHERE model_id = 'gpt-5.6-sol'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .expect("query custom GPT-5.6 Sol price");
+    assert_eq!(
+        sol,
+        (
+            "Custom GPT-5.6 Sol".to_string(),
+            "9".to_string(),
+            "99".to_string(),
+            "0.9".to_string(),
+            "9.9".to_string(),
+        )
+    );
+
+    let terra: (String, String, String, String) = conn
+        .query_row(
+            "SELECT input_cost_per_million, output_cost_per_million,
+                    cache_read_cost_per_million, cache_creation_cost_per_million
+             FROM model_pricing WHERE model_id = 'gpt-5.6-terra'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("query reseeded GPT-5.6 Terra price");
+    assert_eq!(
+        terra,
+        (
+            "2.5".to_string(),
+            "15".to_string(),
+            "0.25".to_string(),
+            "3.125".to_string(),
+        )
     );
 }
 

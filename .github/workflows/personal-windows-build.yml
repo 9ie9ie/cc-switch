@@ -43,7 +43,9 @@ jobs:
 
       - name: Rust tests
         working-directory: src-tauri
-        run: cargo test reasoning
+        run: |
+          cargo test reasoning
+          cargo test model_pricing
 
       - name: Build unsigned NSIS bundle
         run: pnpm tauri build --bundles nsis --config .github/tauri.personal.conf.json
