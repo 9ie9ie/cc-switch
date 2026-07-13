@@ -2378,7 +2378,10 @@ mod tests {
         assert_eq!(detail.reasoning_output_tokens, 1552);
         let json = serde_json::to_value(detail)
             .map_err(|e| AppError::Database(format!("序列化请求日志失败: {e}")))?;
-        assert_eq!(json.get("reasoningOutputTokens"), Some(&serde_json::json!(1552)));
+        assert_eq!(
+            json.get("reasoningOutputTokens"),
+            Some(&serde_json::json!(1552))
+        );
         Ok(())
     }
 

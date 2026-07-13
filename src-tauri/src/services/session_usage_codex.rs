@@ -50,10 +50,7 @@ struct DeltaTokens {
 
 impl DeltaTokens {
     fn is_zero(&self) -> bool {
-        self.input == 0
-            && self.cached_input == 0
-            && self.output == 0
-            && self.reasoning_output == 0
+        self.input == 0 && self.cached_input == 0 && self.output == 0 && self.reasoning_output == 0
     }
 }
 
@@ -276,9 +273,7 @@ fn compute_delta(prev: &Option<CumulativeTokens>, current: &CumulativeTokens) ->
             input: current.input.saturating_sub(p.input) as u32,
             cached_input: current.cached_input.saturating_sub(p.cached_input) as u32,
             output: current.output.saturating_sub(p.output) as u32,
-            reasoning_output: current
-                .reasoning_output
-                .saturating_sub(p.reasoning_output) as u32,
+            reasoning_output: current.reasoning_output.saturating_sub(p.reasoning_output) as u32,
         },
     }
 }

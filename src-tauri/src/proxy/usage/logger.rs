@@ -422,9 +422,8 @@ mod tests {
 
         // 验证记录已插入
         let conn = crate::database::lock_conn!(db.conn);
-        let (count, request_model, reasoning_tokens, input_semantics):
-            (i64, String, i64, i64) = conn
-            .query_row(
+        let (count, request_model, reasoning_tokens, input_semantics): (i64, String, i64, i64) =
+            conn.query_row(
                 "SELECT COUNT(*), request_model, reasoning_output_tokens, input_token_semantics
                  FROM proxy_request_logs WHERE request_id = 'req-123'",
                 [],
