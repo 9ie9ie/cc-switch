@@ -796,6 +796,29 @@ mod tests {
         })
     }
 
+    fn token_count_with_reasoning(
+        input: u64,
+        cached: u64,
+        output: u64,
+        reasoning: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": "2026-07-10T03:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": { "total_token_usage": {
+                    "input_tokens": input,
+                    "cached_input_tokens": cached,
+                    "output_tokens": output,
+                    "output_tokens_details": {
+                        "reasoning_tokens": reasoning
+                    }
+                }}
+            }
+        })
+    }
+
     #[test]
     fn test_delta_first_event() {
         let prev = None;
@@ -958,28 +981,28 @@ mod tests {
             &[
                 session_meta("child", "parent"),
                 turn_context(),
-                token_count(1_000, 900, 100),
-                token_count(1_200, 1_000, 120),
+                token_count_with_reasoning(1_000, 900, 100, 100),
+                token_count_with_reasoning(1_200, 1_000, 120, 200),
                 serde_json::json!({
                     "timestamp": "2026-07-10T03:00:03Z",
                     "type": "event_msg",
                     "payload": { "type": "thread_settings_applied" }
                 }),
-                token_count(1_300, 1_050, 150),
+                token_count_with_reasoning(1_300, 1_050, 150, 716),
             ],
         );
 
         assert_eq!(sync_single_codex_file(&db, &child)?, (1, 2));
 
         let conn = lock_conn!(db.conn);
-        let usage: (i64, i64, i64) = conn.query_row(
-            "SELECT input_tokens, cache_read_tokens, output_tokens
+        let usage: (i64, i64, i64, i64) = conn.query_row(
+            "SELECT input_tokens, cache_read_tokens, output_tokens, reasoning_output_tokens
              FROM proxy_request_logs
              WHERE request_id = 'codex_session:thread-v1:child:3'",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
-        assert_eq!(usage, (100, 50, 30));
+        assert_eq!(usage, (100, 50, 30, 516));
 
         Ok(())
     }

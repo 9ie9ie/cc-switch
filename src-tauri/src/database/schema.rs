@@ -2809,6 +2809,33 @@ mod tests {
     }
 
     #[test]
+    fn custom_v12_database_upgrades_to_complete_upstream_v13() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let conn = lock_conn!(db.conn);
+        conn.execute_batch(
+            "DROP TABLE profiles;
+             ALTER TABLE proxy_request_logs DROP COLUMN input_token_semantics;
+             ALTER TABLE usage_daily_rollups DROP COLUMN input_token_semantics;",
+        )?;
+        Database::set_user_version(&conn, 12)?;
+
+        Database::create_tables_on_conn(&conn)?;
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, 13);
+        assert!(Database::table_exists(&conn, "profiles")?);
+        for table in ["proxy_request_logs", "usage_daily_rollups"] {
+            assert!(Database::has_column(
+                &conn,
+                table,
+                "reasoning_output_tokens"
+            )?);
+            assert!(Database::has_column(&conn, table, "input_token_semantics")?);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn migrate_v12_to_v13_adds_input_token_semantics_columns() -> Result<(), AppError> {
         let conn = Connection::open_in_memory()?;
         conn.execute(

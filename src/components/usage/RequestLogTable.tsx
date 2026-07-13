@@ -45,7 +45,7 @@ interface RequestLogTableProps {
 
 const REASONING_TOKEN_WARNING_MAX_N = 4;
 
-function isReasoningTokenWarning(tokens: number): boolean {
+export function isReasoningTokenWarning(tokens: number): boolean {
   if (!Number.isInteger(tokens) || tokens <= 0) return false;
   const n = (tokens + 2) / 518;
   return Number.isInteger(n) && n >= 1 && n <= REASONING_TOKEN_WARNING_MAX_N;

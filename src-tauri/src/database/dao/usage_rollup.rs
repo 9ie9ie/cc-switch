@@ -356,11 +356,12 @@ mod tests {
             conn.execute(
                 "INSERT INTO proxy_request_logs (
                     request_id, provider_id, app_type, model,
-                    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                    input_tokens, output_tokens, reasoning_output_tokens,
+                    cache_read_tokens, cache_creation_tokens,
                     input_token_semantics, total_cost_usd,
                     latency_ms, status_code, created_at
                 ) VALUES ('total-semantics-rollup', 'p1', 'codex', 'gpt-5.5',
-                          100, 5, 10, 20, 1, '0.10', 100, 200, ?1)",
+                          100, 5, 516, 10, 20, 1, '0.10', 100, 200, ?1)",
                 [old_ts],
             )?;
         }
@@ -368,14 +369,23 @@ mod tests {
         assert_eq!(db.rollup_and_prune(30)?, 1);
 
         let conn = crate::database::lock_conn!(db.conn);
-        let row: (i64, i64, i64, i64) = conn.query_row(
-            "SELECT input_tokens, cache_read_tokens, cache_creation_tokens,
+        let row: (i64, i64, i64, i64, i64) = conn.query_row(
+            "SELECT input_tokens, reasoning_output_tokens,
+                    cache_read_tokens, cache_creation_tokens,
                     input_token_semantics
              FROM usage_daily_rollups WHERE model = 'gpt-5.5'",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )?;
-        assert_eq!(row, (70, 10, 20, 2));
+        assert_eq!(row, (70, 516, 10, 20, 2));
 
         Ok(())
     }

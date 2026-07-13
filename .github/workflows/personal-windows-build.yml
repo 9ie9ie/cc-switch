@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - codex/reasoning-token-display
+      - codex/reasoning-token-v3.17
 
 permissions:
   contents: read
@@ -39,11 +39,19 @@ jobs:
         run: pnpm typecheck
 
       - name: Frontend tests
-        run: pnpm test:unit -- tests/components/RequestLogTable.test.tsx
+        run: pnpm exec vitest run tests/components/RequestLogTable.test.tsx
+
+      - name: Rust format check
+        working-directory: src-tauri
+        run: cargo fmt --all -- --check
 
       - name: Rust tests
         working-directory: src-tauri
-        run: cargo test reasoning
+        run: |
+          cargo test reasoning
+          cargo test custom_v12_database_upgrades_to_complete_upstream_v13
+          cargo test test_log_request
+          cargo test test_rollup_normalizes_total_cache_semantics_to_fresh
 
       - name: Build unsigned NSIS bundle
         run: pnpm tauri build --bundles nsis --config .github/tauri.personal.conf.json

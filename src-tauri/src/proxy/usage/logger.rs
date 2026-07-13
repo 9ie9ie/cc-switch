@@ -396,7 +396,7 @@ mod tests {
         let usage = TokenUsage {
             input_tokens: 1000,
             output_tokens: 500,
-            reasoning_output_tokens: 0,
+            reasoning_output_tokens: 516,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             model: None,
@@ -406,7 +406,7 @@ mod tests {
         logger.log_with_calculation(
             "req-123".to_string(),
             "provider-1".to_string(),
-            "claude".to_string(),
+            "codex".to_string(),
             "test-model".to_string(),
             "req-model".to_string(),
             "test-model".to_string(),
@@ -416,21 +416,25 @@ mod tests {
             None,
             200,
             None,
-            Some("claude".to_string()),
+            Some("codex".to_string()),
             false,
         )?;
 
         // 验证记录已插入
         let conn = crate::database::lock_conn!(db.conn);
-        let (count, request_model): (i64, String) = conn
+        let (count, request_model, reasoning_tokens, input_semantics):
+            (i64, String, i64, i64) = conn
             .query_row(
-                "SELECT COUNT(*), request_model FROM proxy_request_logs WHERE request_id = 'req-123'",
+                "SELECT COUNT(*), request_model, reasoning_output_tokens, input_token_semantics
+                 FROM proxy_request_logs WHERE request_id = 'req-123'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
         assert_eq!(count, 1);
         assert_eq!(request_model, "req-model");
+        assert_eq!(reasoning_tokens, 516);
+        assert_eq!(input_semantics, INPUT_TOKEN_SEMANTICS_TOTAL);
         Ok(())
     }
 

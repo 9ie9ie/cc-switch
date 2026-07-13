@@ -2357,6 +2357,32 @@ mod tests {
     }
 
     #[test]
+    fn request_log_detail_maps_and_serializes_reasoning_tokens() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model,
+                    input_tokens, output_tokens, reasoning_output_tokens,
+                    latency_ms, status_code, created_at
+                 ) VALUES ('reasoning-detail', '_codex_session', 'codex', 'gpt-5.5',
+                           100, 20, 1552, 0, 200, 1000)",
+                [],
+            )?;
+        }
+
+        let detail = db
+            .get_request_detail("reasoning-detail")?
+            .expect("inserted request log");
+        assert_eq!(detail.reasoning_output_tokens, 1552);
+        let json = serde_json::to_value(detail)
+            .map_err(|e| AppError::Database(format!("序列化请求日志失败: {e}")))?;
+        assert_eq!(json.get("reasoningOutputTokens"), Some(&serde_json::json!(1552)));
+        Ok(())
+    }
+
+    #[test]
     fn test_effective_filter_keeps_legacy_null_data_source_proxy_rows() -> Result<(), AppError> {
         let conn = Connection::open_in_memory()?;
         create_legacy_nullable_logs_table(&conn)?;

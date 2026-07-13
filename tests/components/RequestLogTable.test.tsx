@@ -1,6 +1,9 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { RequestLogTable } from "@/components/usage/RequestLogTable";
+import {
+  isReasoningTokenWarning,
+  RequestLogTable,
+} from "@/components/usage/RequestLogTable";
 import type { UsageRangeSelection } from "@/types/usage";
 
 const useRequestLogsMock = vi.hoisted(() => vi.fn());
@@ -70,6 +73,20 @@ describe("RequestLogTable", () => {
       }),
     );
   });
+
+  it.each([516, 1034, 1552, 2070])(
+    "marks %i reasoning tokens as suspicious",
+    (tokens) => {
+      expect(isReasoningTokenWarning(tokens)).toBe(true);
+    },
+  );
+
+  it.each([0, 515, 517, 2588, 516.5])(
+    "does not mark %s reasoning tokens as suspicious",
+    (tokens) => {
+      expect(isReasoningTokenWarning(tokens)).toBe(false);
+    },
+  );
 
   it("resets pagination when the dashboard range changes", async () => {
     const initialRange: UsageRangeSelection = { preset: "today" };
