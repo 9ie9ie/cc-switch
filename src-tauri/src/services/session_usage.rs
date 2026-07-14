@@ -366,7 +366,13 @@ pub(crate) fn get_sync_state(db: &Database, file_path: &str) -> Result<(i64, i64
         rusqlite::params![file_path],
         |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
     );
-    Ok(result.unwrap_or((0, 0)))
+    match result {
+        Ok(state) => Ok(state),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok((0, 0)),
+        Err(error) => Err(AppError::Database(format!(
+            "查询 session 日志同步状态失败: {error}"
+        ))),
+    }
 }
 
 /// 返回文件 mtime 的纳秒时间戳。
@@ -566,6 +572,19 @@ pub fn get_data_source_breakdown(db: &Database) -> Result<Vec<DataSourceSummary>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_sync_state_only_treats_missing_rows_as_unsynced() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        assert_eq!(get_sync_state(&db, "missing.jsonl")?, (0, 0));
+
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute("DROP TABLE session_log_sync", [])?;
+        }
+        assert!(get_sync_state(&db, "missing.jsonl").is_err());
+        Ok(())
+    }
 
     #[test]
     fn test_parse_usage_from_jsonl_line() {

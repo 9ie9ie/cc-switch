@@ -231,6 +231,22 @@ fn data_source_expr(log_alias: &str) -> String {
     format!("COALESCE({log_alias}.data_source, 'proxy')")
 }
 
+/// 跨源去重使用请求模型；缺失时回退到响应模型。
+fn dedup_model_sql(log_alias: &str) -> String {
+    format!("COALESCE(NULLIF({log_alias}.request_model, ''), {log_alias}.model)")
+}
+
+/// reasoning token 的 0 表示未知，仅双方都有值时才要求相等。
+fn reasoning_tokens_match_sql(left: &str, right: &str) -> String {
+    format!("({left} = 0 OR {right} = 0 OR {left} = {right})")
+}
+
+fn dedup_models_match_sql(left: &str, right: &str) -> String {
+    format!(
+        "(LOWER({left}) = LOWER({right}) OR LOWER({left}) = 'unknown' OR LOWER({right}) = 'unknown')"
+    )
+}
+
 /// SQL 标量表达式：把 Claude Desktop 网关的 `claude-desktop` app_type 在“展示口径”
 /// 上折叠进 `claude`，其余 app_type 原样返回。
 ///
@@ -299,6 +315,13 @@ fn push_provider_model_filters(
 pub(crate) fn effective_usage_log_filter(log_alias: &str) -> String {
     let data_source = data_source_expr(log_alias);
     let proxy_data_source = data_source_expr("proxy_dedup");
+    let log_model = dedup_model_sql(log_alias);
+    let proxy_model = dedup_model_sql("proxy_dedup");
+    let reasoning_tokens_match = reasoning_tokens_match_sql(
+        "proxy_dedup.reasoning_output_tokens",
+        &format!("{log_alias}.reasoning_output_tokens"),
+    );
+    let models_match = dedup_models_match_sql(&proxy_model, &log_model);
     format!(
         "NOT (
             {data_source} IN ('session_log', 'codex_session', 'gemini_session', 'opencode_session')
@@ -311,7 +334,7 @@ pub(crate) fn effective_usage_log_filter(log_alias: &str) -> String {
                   AND proxy_dedup.status_code < 300
                   AND proxy_dedup.input_tokens = {log_alias}.input_tokens
                   AND proxy_dedup.output_tokens = {log_alias}.output_tokens
-                  AND proxy_dedup.reasoning_output_tokens = {log_alias}.reasoning_output_tokens
+                  AND {reasoning_tokens_match}
                   AND proxy_dedup.cache_read_tokens = {log_alias}.cache_read_tokens
                   AND (
                       proxy_dedup.cache_creation_tokens = {log_alias}.cache_creation_tokens
@@ -323,11 +346,7 @@ pub(crate) fn effective_usage_log_filter(log_alias: &str) -> String {
                   AND proxy_dedup.created_at BETWEEN
                       {log_alias}.created_at - {SESSION_PROXY_DEDUP_WINDOW_SECONDS}
                       AND {log_alias}.created_at + {SESSION_PROXY_DEDUP_WINDOW_SECONDS}
-                  AND (
-                      LOWER(proxy_dedup.model) = LOWER({log_alias}.model)
-                      OR LOWER(proxy_dedup.model) = 'unknown'
-                      OR LOWER({log_alias}.model) = 'unknown'
-                  )
+                  AND {models_match}
             )
         )"
     )
@@ -381,6 +400,9 @@ pub(crate) fn has_matching_proxy_usage_log(
         matches!(key.app_type, "codex" | "gemini" | "opencode") && key.cache_creation_tokens == 0;
 
     let l_data_source = data_source_expr("l");
+    let l_model = dedup_model_sql("l");
+    let reasoning_tokens_match = reasoning_tokens_match_sql("l.reasoning_output_tokens", "?5");
+    let models_match = dedup_models_match_sql(&l_model, "?2");
     let sql = format!(
         "SELECT EXISTS (
             SELECT 1
@@ -391,15 +413,11 @@ pub(crate) fn has_matching_proxy_usage_log(
               AND l.status_code < 300
               AND l.input_tokens = ?3
               AND l.output_tokens = ?4
-              AND l.reasoning_output_tokens = ?5
+              AND {reasoning_tokens_match}
               AND l.cache_read_tokens = ?6
               AND (l.cache_creation_tokens = ?7 OR ?10 = 1)
               AND l.created_at BETWEEN ?8 - ?9 AND ?8 + ?9
-              AND (
-                  LOWER(l.model) = LOWER(?2)
-                  OR LOWER(l.model) = 'unknown'
-                  OR LOWER(?2) = 'unknown'
-              )
+              AND {models_match}
         )"
     );
 
@@ -2342,6 +2360,7 @@ mod tests {
                 request_id TEXT PRIMARY KEY,
                 app_type TEXT NOT NULL,
                 model TEXT NOT NULL,
+                request_model TEXT,
                 input_tokens INTEGER NOT NULL,
                 output_tokens INTEGER NOT NULL,
                 reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
@@ -2428,6 +2447,130 @@ mod tests {
             created_at: 1000,
         };
         assert!(has_matching_proxy_usage_log(&conn, &key)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_cross_source_dedup_treats_zero_reasoning_as_unknown() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let conn = lock_conn!(db.conn);
+
+        insert_usage_log(
+            &conn,
+            "codex-proxy-reasoning-unknown",
+            "codex",
+            "openai",
+            "gpt-5.5",
+            "proxy",
+            1_000,
+            100,
+            20,
+            10,
+            7,
+            200,
+            "0.10",
+        )?;
+        insert_usage_log(
+            &conn,
+            "codex-session-with-reasoning",
+            "codex",
+            "_codex_session",
+            "gpt-5.5",
+            "codex_session",
+            1_060,
+            100,
+            20,
+            10,
+            0,
+            200,
+            "0.10",
+        )?;
+        conn.execute(
+            "UPDATE proxy_request_logs
+             SET reasoning_output_tokens = 256
+             WHERE request_id = 'codex-session-with-reasoning'",
+            [],
+        )?;
+
+        let key = DedupKey {
+            app_type: "codex",
+            model: "gpt-5.5",
+            input_tokens: 100,
+            output_tokens: 20,
+            reasoning_output_tokens: 256,
+            cache_read_tokens: 10,
+            cache_creation_tokens: 0,
+            created_at: 1_060,
+        };
+        assert!(has_matching_proxy_usage_log(&conn, &key)?);
+
+        let filter = effective_usage_log_filter("l");
+        let sql = format!("SELECT COUNT(*) FROM proxy_request_logs l WHERE {filter}");
+        let count: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
+        assert_eq!(count, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_cross_source_dedup_matches_effective_request_model() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let conn = lock_conn!(db.conn);
+
+        insert_usage_log(
+            &conn,
+            "codex-proxy-request-model",
+            "codex",
+            "openai",
+            "proxy-response-model",
+            "proxy",
+            2_000,
+            100,
+            20,
+            10,
+            7,
+            200,
+            "0.10",
+        )?;
+        insert_usage_log(
+            &conn,
+            "codex-session-request-model",
+            "codex",
+            "_codex_session",
+            "session-response-model",
+            "codex_session",
+            2_060,
+            100,
+            20,
+            10,
+            0,
+            200,
+            "0.10",
+        )?;
+        conn.execute(
+            "UPDATE proxy_request_logs
+             SET request_model = 'gpt-5.5'
+             WHERE request_id IN ('codex-proxy-request-model', 'codex-session-request-model')",
+            [],
+        )?;
+
+        let key = DedupKey {
+            app_type: "codex",
+            model: "gpt-5.5",
+            input_tokens: 100,
+            output_tokens: 20,
+            reasoning_output_tokens: 0,
+            cache_read_tokens: 10,
+            cache_creation_tokens: 0,
+            created_at: 2_060,
+        };
+        assert!(has_matching_proxy_usage_log(&conn, &key)?);
+
+        let filter = effective_usage_log_filter("l");
+        let sql = format!("SELECT COUNT(*) FROM proxy_request_logs l WHERE {filter}");
+        let count: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
+        assert_eq!(count, 1);
 
         Ok(())
     }

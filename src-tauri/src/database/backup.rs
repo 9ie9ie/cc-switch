@@ -22,6 +22,7 @@ const SYNC_SKIP_TABLES: &[&str] = &[
     "provider_health",
     "proxy_live_backup",
     "usage_daily_rollups",
+    "session_log_sync",
 ];
 
 /// Tables whose local data is preserved (restored from local snapshot) during WebDAV import.
@@ -31,6 +32,7 @@ const SYNC_PRESERVE_TABLES: &[&str] = &[
     "stream_check_logs",
     "proxy_live_backup",
     "usage_daily_rollups",
+    "session_log_sync",
 ];
 
 /// A database backup entry for the UI
@@ -738,6 +740,12 @@ mod tests {
                 ) VALUES ('local-provider', 'Local Provider', 'claude', 'operational', 1, 'ok', 42, 200, 'claude-3', 0, 1000)",
                 [],
             )?;
+            conn.execute(
+                "INSERT INTO session_log_sync (
+                    file_path, last_modified, last_line_offset, last_synced_at
+                ) VALUES ('C:\\local\\session.jsonl', 123, 456, 789)",
+                [],
+            )?;
         }
 
         local_db.import_sql_string_for_sync(&remote_sql)?;
@@ -755,7 +763,7 @@ mod tests {
             "remote config should be imported"
         );
 
-        let (request_logs, rollups, stream_logs): (i64, i64, i64) = {
+        let (request_logs, rollups, stream_logs, sync_rows): (i64, i64, i64, i64) = {
             let conn = crate::database::lock_conn!(local_db.conn);
             let request_logs =
                 conn.query_row("SELECT COUNT(*) FROM proxy_request_logs", [], |row| {
@@ -769,7 +777,14 @@ mod tests {
                 conn.query_row("SELECT COUNT(*) FROM stream_check_logs", [], |row| {
                     row.get(0)
                 })?;
-            (request_logs, rollups, stream_logs)
+            let sync_rows = conn.query_row(
+                "SELECT COUNT(*) FROM session_log_sync
+                 WHERE file_path = 'C:\\local\\session.jsonl'
+                   AND last_line_offset = 456",
+                [],
+                |row| row.get(0),
+            )?;
+            (request_logs, rollups, stream_logs, sync_rows)
         };
         assert_eq!(request_logs, 1, "local request logs should be preserved");
         assert_eq!(rollups, 1, "local rollups should be preserved");
@@ -777,6 +792,7 @@ mod tests {
             stream_logs, 1,
             "local stream check logs should be preserved"
         );
+        assert_eq!(sync_rows, 1, "local session cursors should be preserved");
 
         Ok(())
     }
