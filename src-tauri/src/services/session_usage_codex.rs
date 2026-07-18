@@ -134,6 +134,7 @@ fn codex_history_replay_boundary(
     }
 
     let file = fs::File::open(file_path).ok()?;
+    let mut thread_settings_boundary = None;
     for (index, line) in BufReader::new(file).lines().enumerate() {
         let Ok(line) = line else {
             continue;
@@ -149,19 +150,24 @@ fn codex_history_replay_boundary(
         let Some(event_type) = value.get("type").and_then(|value| value.as_str()) else {
             continue;
         };
-        let is_replay_boundary = event_type.starts_with("inter_agent_communication")
-            || (event_type == "event_msg"
-                && value
-                    .get("payload")
-                    .and_then(|payload| payload.get("type"))
-                    .and_then(|value| value.as_str())
-                    == Some("thread_settings_applied"));
-        if is_replay_boundary {
+        if event_type.starts_with("inter_agent_communication") {
             return Some(index as i64 + 1);
+        }
+
+        let is_thread_settings = event_type == "event_msg"
+            && value
+                .get("payload")
+                .and_then(|payload| payload.get("type"))
+                .and_then(|value| value.as_str())
+                == Some("thread_settings_applied");
+        if is_thread_settings && thread_settings_boundary.is_none() {
+            // Newer subagent snapshots can contain copied settings events from
+            // the parent. Prefer the first inter-agent handoff when present.
+            thread_settings_boundary = Some(index as i64 + 1);
         }
     }
 
-    None
+    thread_settings_boundary
 }
 
 fn is_history_snapshot_event(state: &FileParseState, line_offset: i64) -> bool {
@@ -982,6 +988,46 @@ mod tests {
                     "timestamp": "2026-07-10T03:00:03Z",
                     "type": "event_msg",
                     "payload": { "type": "thread_settings_applied" }
+                }),
+                token_count_with_reasoning(1_300, 1_050, 150, 716),
+            ],
+        );
+
+        assert_eq!(sync_single_codex_file(&db, &child)?, (1, 2));
+
+        let conn = lock_conn!(db.conn);
+        let usage: (i64, i64, i64, i64) = conn.query_row(
+            "SELECT input_tokens, cache_read_tokens, output_tokens, reasoning_output_tokens
+             FROM proxy_request_logs
+             WHERE request_id = 'codex_session:thread-v1:child:3'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(usage, (100, 50, 30, 516));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_inter_agent_handoff_overrides_copied_thread_settings() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let child = temp.path().join("child-with-copied-settings.jsonl");
+        write_jsonl(
+            &child,
+            &[
+                session_meta("child", "parent"),
+                turn_context(),
+                token_count_with_reasoning(1_000, 900, 100, 100),
+                serde_json::json!({
+                    "timestamp": "2026-07-10T03:00:02Z",
+                    "type": "event_msg",
+                    "payload": { "type": "thread_settings_applied" }
+                }),
+                token_count_with_reasoning(1_200, 1_000, 120, 200),
+                serde_json::json!({
+                    "timestamp": "2026-07-10T03:00:03Z",
+                    "type": "inter_agent_communication_metadata"
                 }),
                 token_count_with_reasoning(1_300, 1_050, 150, 716),
             ],

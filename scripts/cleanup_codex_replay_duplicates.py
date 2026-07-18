@@ -33,6 +33,7 @@ class ReplayPrefix:
     event_count: int
     source_path: Path
     reason: str
+    legacy_ids_safe: bool = True
 
 
 @dataclass
@@ -366,7 +367,7 @@ def analyze_replay_prefixes(
     prefixes: dict[str, ReplayPrefix] = {}
     sequence_cache: dict[str, list[tuple[int, int, int, int]]] = {}
     candidate_files = 0
-    unsafe_parent_ids = 0
+    thread_v1_only_files = 0
     reason_counts = {"explicit": 0, "parent-prefix": 0, "timestamp-cluster": 0}
 
     for path in iter_codex_files(codex_dir):
@@ -382,13 +383,12 @@ def analyze_replay_prefixes(
             continue
         candidate_files += 1
 
-        # The old importer used session_id before id. If that points to the
-        # parent, request ids collide with genuine parent rows and are unsafe to
-        # delete. INSERT OR IGNORE also means those replay rows were normally not
-        # duplicated in the first place.
-        if old_importer_id != thread_id:
-            unsafe_parent_ids += 1
-            continue
+        # The old importer used session_id before id. If it differs from the
+        # current thread id, legacy request ids can refer to parent history and
+        # are unsafe. Current thread-v1 ids still identify the child safely.
+        thread_v1_only = old_importer_id != thread_id
+        if thread_v1_only:
+            thread_v1_only_files += 1
 
         candidates: list[tuple[int, str]] = []
         explicit_count = replay_event_count(path)
@@ -407,10 +407,11 @@ def analyze_replay_prefixes(
             if parent_count:
                 candidates.append((parent_count, "parent-prefix"))
 
-        # Timestamp clustering is a fallback for legacy forks whose parent rows
-        # have already been rolled up and whose files predate explicit markers.
-        # Never let this heuristic override either exact source evidence above.
-        if not candidates:
+        # Timestamp clustering remains a fallback for legacy-safe forks. A
+        # current thread-v1 child can contain copied early markers, so for an id
+        # mismatch compare the initial timestamp cluster with marker evidence
+        # and retain the larger replay prefix.
+        if thread_v1_only or not candidates:
             timestamp_count = timestamp_cluster_replay_count(
                 path, payload.get("timestamp")
             )
@@ -420,20 +421,34 @@ def analyze_replay_prefixes(
         if candidates:
             count, reason = max(candidates, key=lambda item: item[0])
             current = prefixes.get(thread_id)
+            legacy_ids_safe = not thread_v1_only and (
+                current is None or current.legacy_ids_safe
+            )
             if current is None or count > current.event_count:
-                prefixes[thread_id] = ReplayPrefix(thread_id, count, path, reason)
+                prefixes[thread_id] = ReplayPrefix(
+                    thread_id, count, path, reason, legacy_ids_safe
+                )
+            elif current.legacy_ids_safe and not legacy_ids_safe:
+                prefixes[thread_id] = ReplayPrefix(
+                    current.thread_id,
+                    current.event_count,
+                    current.source_path,
+                    current.reason,
+                    False,
+                )
 
     for prefix in prefixes.values():
         reason_counts[prefix.reason] += 1
-    return list(prefixes.values()), candidate_files, unsafe_parent_ids, reason_counts
+    return list(prefixes.values()), candidate_files, thread_v1_only_files, reason_counts
 
 
 def candidate_request_ids(prefixes: Iterable[ReplayPrefix]) -> set[str]:
     result: set[str] = set()
     for prefix in prefixes:
         for index in range(1, prefix.event_count + 1):
-            result.add(f"{LEGACY_PREFIX}:{prefix.thread_id}:{index}")
             result.add(f"{THREAD_V1_PREFIX}:{prefix.thread_id}:{index}")
+            if prefix.legacy_ids_safe:
+                result.add(f"{LEGACY_PREFIX}:{prefix.thread_id}:{index}")
     return result
 
 
@@ -558,8 +573,8 @@ def main() -> int:
     try:
         before = codex_totals(conn)
         known_ids = legacy_session_ids(conn)
-        prefixes, candidate_files, unsafe_parent_ids, reason_counts = analyze_replay_prefixes(
-            conn, args.codex_dir, known_ids
+        prefixes, candidate_files, thread_v1_only_files, reason_counts = (
+            analyze_replay_prefixes(conn, args.codex_dir, known_ids)
         )
         generated_ids = candidate_request_ids(prefixes)
         duplicate_stats = existing_candidate_stats(conn, generated_ids)
@@ -574,7 +589,7 @@ def main() -> int:
             f"parent-prefix={reason_counts['parent-prefix']:,}, "
             f"timestamp-cluster={reason_counts['timestamp-cluster']:,}"
         )
-        print(f"Parent-id collision files skipped: {unsafe_parent_ids:,}")
+        print(f"Thread-v1-only collision files: {thread_v1_only_files:,}")
         print(f"Duplicate rows matched: {duplicate_stats['rows']:,}")
         print(f"Duplicate input tokens: {duplicate_stats['input']:,}")
         print(f"Duplicate output tokens: {duplicate_stats['output']:,}")

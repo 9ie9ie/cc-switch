@@ -49,12 +49,17 @@ jobs:
         working-directory: src-tauri
         run: |
           cargo test reasoning
+          cargo test session_usage_codex::tests
           cargo test dedup
           cargo test get_sync_state_only_treats_missing_rows_as_unsynced
           cargo test sync_import_preserves_local_only_tables
           cargo test custom_v12_database_upgrades_to_complete_upstream_v13
           cargo test test_log_request
           cargo test test_rollup_normalizes_total_cache_semantics_to_fresh
+
+      - name: Replay cleanup tests
+        working-directory: scripts
+        run: python -B -m unittest test_cleanup_codex_replay_duplicates.py -v
 
       - name: Build unsigned NSIS bundle
         run: pnpm tauri build --bundles nsis --config .github/tauri.personal.conf.json
