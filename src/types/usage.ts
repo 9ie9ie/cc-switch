@@ -19,6 +19,7 @@ export interface RequestLog {
   costMultiplier: string;
   inputTokens: number;
   outputTokens: number;
+  reasoningOutputTokens?: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
   inputCostUsd: string;
@@ -252,6 +253,7 @@ type UsageCostLog = Pick<
   RequestLog,
   | "inputTokens"
   | "outputTokens"
+  | "reasoningOutputTokens"
   | "cacheReadTokens"
   | "cacheCreationTokens"
   | "totalCostUsd"
@@ -263,6 +265,7 @@ export function hasUsageTokens(log: UsageCostLog): boolean {
   return (
     log.inputTokens > 0 ||
     log.outputTokens > 0 ||
+    (log.reasoningOutputTokens ?? 0) > 0 ||
     log.cacheReadTokens > 0 ||
     log.cacheCreationTokens > 0
   );

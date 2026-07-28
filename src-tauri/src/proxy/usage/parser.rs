@@ -52,6 +52,7 @@ fn response_id(body: &Value, field: &str) -> Option<String> {
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    pub reasoning_output_tokens: u32,
     pub cache_read_tokens: u32,
     pub cache_creation_tokens: u32,
     /// 从响应中提取的实际模型名称（如果可用）
@@ -87,12 +88,32 @@ impl TokenUsage {
     pub fn has_billable_tokens(&self) -> bool {
         self.input_tokens > 0
             || self.output_tokens > 0
+            || self.reasoning_output_tokens > 0
             || self.cache_read_tokens > 0
             || self.cache_creation_tokens > 0
     }
 }
 
 impl TokenUsage {
+    fn reasoning_output_tokens_from_usage(usage: &Value) -> u32 {
+        usage
+            .get("reasoning_output_tokens")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                usage
+                    .get("output_tokens_details")
+                    .and_then(|details| details.get("reasoning_tokens"))
+                    .and_then(Value::as_u64)
+            })
+            .or_else(|| {
+                usage
+                    .get("completion_tokens_details")
+                    .and_then(|details| details.get("reasoning_tokens"))
+                    .and_then(Value::as_u64)
+            })
+            .unwrap_or(0) as u32
+    }
+
     /// 从 Claude API 非流式响应解析
     pub fn from_claude_response(body: &Value) -> Option<Self> {
         let usage = body.get("usage")?;
@@ -106,6 +127,7 @@ impl TokenUsage {
         Some(Self {
             input_tokens: usage.get("input_tokens")?.as_u64()? as u32,
             output_tokens: usage.get("output_tokens")?.as_u64()? as u32,
+            reasoning_output_tokens: 0,
             cache_read_tokens: usage
                 .get("cache_read_input_tokens")
                 .and_then(|v| v.as_u64())
@@ -270,6 +292,7 @@ impl TokenUsage {
         Some(Self {
             input_tokens: input_tokens? as u32,
             output_tokens: output_tokens? as u32,
+            reasoning_output_tokens: Self::reasoning_output_tokens_from_usage(usage),
             cache_read_tokens: cached_tokens,
             cache_creation_tokens: cache_write_tokens,
             model,
@@ -343,6 +366,7 @@ impl TokenUsage {
         Some(Self {
             input_tokens: prompt_tokens as u32,
             output_tokens: completion_tokens as u32,
+            reasoning_output_tokens: Self::reasoning_output_tokens_from_usage(usage),
             cache_read_tokens: cached_tokens,
             cache_creation_tokens: cache_write_tokens,
             model,
@@ -390,6 +414,7 @@ impl TokenUsage {
         Some(Self {
             input_tokens: prompt_tokens,
             output_tokens,
+            reasoning_output_tokens: 0,
             cache_read_tokens: usage
                 .get("cachedContentTokenCount")
                 .and_then(|v| v.as_u64())
@@ -448,6 +473,7 @@ impl TokenUsage {
             Some(Self {
                 input_tokens: total_input,
                 output_tokens: total_output,
+                reasoning_output_tokens: 0,
                 cache_read_tokens: total_cache_read,
                 cache_creation_tokens: 0,
                 model,
@@ -575,6 +601,45 @@ mod tests {
             ..Default::default()
         };
         assert!(normal.has_billable_tokens());
+        let only_reasoning = TokenUsage {
+            reasoning_output_tokens: 516,
+            ..Default::default()
+        };
+        assert!(only_reasoning.has_billable_tokens());
+    }
+
+    #[test]
+    fn codex_response_parses_reasoning_output_tokens() {
+        let response = json!({
+            "model": "gpt-5.6",
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 800,
+                "output_tokens_details": {
+                    "reasoning_tokens": 516
+                }
+            }
+        });
+
+        let usage = TokenUsage::from_codex_response(&response).unwrap();
+        assert_eq!(usage.reasoning_output_tokens, 516);
+    }
+
+    #[test]
+    fn openai_response_parses_completion_reasoning_tokens() {
+        let response = json!({
+            "model": "gpt-5.6",
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 800,
+                "completion_tokens_details": {
+                    "reasoning_tokens": 1034
+                }
+            }
+        });
+
+        let usage = TokenUsage::from_openai_response(&response).unwrap();
+        assert_eq!(usage.reasoning_output_tokens, 1034);
     }
 
     #[test]
