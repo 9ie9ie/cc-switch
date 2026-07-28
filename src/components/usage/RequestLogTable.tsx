@@ -43,6 +43,14 @@ interface RequestLogTableProps {
   onRangeChange?: (range: UsageRangeSelection) => void;
 }
 
+const REASONING_TOKEN_WARNING_MAX_N = 4;
+
+export function isReasoningTokenWarning(tokens: number): boolean {
+  if (!Number.isInteger(tokens) || tokens <= 0) return false;
+  const n = (tokens + 2) / 518;
+  return Number.isInteger(n) && n >= 1 && n <= REASONING_TOKEN_WARNING_MAX_N;
+}
+
 export function RequestLogTable({
   range,
   rangeLabel,
@@ -268,7 +276,28 @@ export function RequestLogTable({
                           )}
                         </TableCell>
                         <TableCell className="text-center">
-                          {fmtInt(log.outputTokens, locale)}
+                          <div className="tabular-nums">
+                            {fmtInt(log.outputTokens, locale)}
+                          </div>
+                          {(log.reasoningOutputTokens ?? 0) > 0 && (
+                            <div
+                              className={`text-[10px] whitespace-nowrap tabular-nums ${
+                                isReasoningTokenWarning(
+                                  log.reasoningOutputTokens ?? 0,
+                                )
+                                  ? "text-red-600 font-medium"
+                                  : "text-muted-foreground"
+                              }`}
+                              title={t("usage.reasoningOutputTokens", {
+                                defaultValue: "Reasoning",
+                              })}
+                            >
+                              {t("usage.reasoningOutputTokens", {
+                                defaultValue: "Reasoning",
+                              })}{" "}
+                              {fmtInt(log.reasoningOutputTokens ?? 0, locale)}
+                            </div>
+                          )}
                         </TableCell>
                         <TableCell className="text-center px-1.5">
                           <div

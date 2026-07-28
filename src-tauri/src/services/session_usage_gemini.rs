@@ -258,6 +258,7 @@ fn insert_gemini_session_entry(
         model,
         input_tokens: tokens.input,
         output_tokens,
+        reasoning_output_tokens: 0,
         cache_read_tokens: tokens.cached,
         cache_creation_tokens: 0,
         created_at,
@@ -270,6 +271,7 @@ fn insert_gemini_session_entry(
     let usage = TokenUsage {
         input_tokens: tokens.input,
         output_tokens,
+        reasoning_output_tokens: 0,
         cache_read_tokens: tokens.cached,
         cache_creation_tokens: 0,
         model: Some(model.to_string()),
