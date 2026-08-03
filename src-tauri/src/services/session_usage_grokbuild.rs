@@ -380,6 +380,7 @@ fn insert_grok_session_entry(
     let usage = TokenUsage {
         input_tokens: clamp(turn.input),
         output_tokens: clamp(turn.output),
+        reasoning_output_tokens: 0,
         cache_read_tokens: clamp(turn.cached),
         cache_creation_tokens: 0,
         model: Some(model.to_string()),

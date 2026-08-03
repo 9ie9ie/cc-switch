@@ -2509,6 +2509,7 @@ mod tests {
             model: "claude-sonnet-4-5",
             input_tokens: 100,
             output_tokens: 20,
+            reasoning_output_tokens: 0,
             cache_read_tokens: 10,
             cache_creation_tokens: 5,
             created_at: 1060,

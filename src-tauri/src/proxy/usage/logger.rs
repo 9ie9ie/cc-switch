@@ -716,6 +716,7 @@ mod tests {
         let usage = TokenUsage {
             input_tokens: 10,
             output_tokens: 5,
+            reasoning_output_tokens: 0,
             cache_read_tokens: 2,
             cache_creation_tokens: 1,
             model: Some("claude-sonnet-4-5".to_string()),

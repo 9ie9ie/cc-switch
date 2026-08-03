@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - codex/reasoning-token-v3.18
+      - codex/reasoning-token-v3.19.1
 
 permissions:
   contents: read
@@ -57,7 +57,7 @@ jobs:
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
-          name: cc-switch-v3.18.0-windows-x64-reasoning-token
+          name: cc-switch-v3.19.1-windows-x64-reasoning-token
           path: |
             src-tauri/target/release/bundle/nsis/*.exe
             src-tauri/target/release/cc-switch.exe
