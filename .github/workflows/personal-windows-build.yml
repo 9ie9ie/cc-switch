@@ -40,8 +40,8 @@ jobs:
       - name: TypeScript type check
         run: pnpm typecheck
 
-      - name: Frontend reasoning tests
-        run: pnpm exec vitest run tests/components/RequestLogTable.test.tsx
+      - name: Frontend unit tests
+        run: pnpm test:unit
 
       - name: Rust format check
         working-directory: src-tauri

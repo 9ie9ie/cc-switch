@@ -42,6 +42,8 @@ impl UsageSemantic {
     }
 
     fn sha256(&self) -> String {
+        // reasoning may be absent on an early replay and present on a later one.
+        // Keep it out of the fallback id so metadata enrichment stays idempotent.
         let encoded = serde_json::to_vec(&(
             &self.app_type,
             &self.provider_id,
@@ -49,7 +51,6 @@ impl UsageSemantic {
             self.input_token_semantics,
             self.input_tokens,
             self.output_tokens,
-            self.reasoning_output_tokens,
             self.cache_read_tokens,
             self.cache_creation_tokens,
             self.status_code,
@@ -59,6 +60,18 @@ impl UsageSemantic {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect()
+    }
+
+    fn matches_except_reasoning(&self, other: &Self) -> bool {
+        self.app_type == other.app_type
+            && self.provider_id == other.provider_id
+            && self.model == other.model
+            && self.input_token_semantics == other.input_token_semantics
+            && self.input_tokens == other.input_tokens
+            && self.output_tokens == other.output_tokens
+            && self.cache_read_tokens == other.cache_read_tokens
+            && self.cache_creation_tokens == other.cache_creation_tokens
+            && self.status_code == other.status_code
     }
 }
 
@@ -142,8 +155,14 @@ impl<'a> UsageLogger<'a> {
             }
             Some((data_source, existing_semantic))
                 if data_source.as_deref().unwrap_or("proxy") == "proxy"
-                    && existing_semantic == semantic =>
+                    && existing_semantic.matches_except_reasoning(&semantic) =>
             {
+                Self::merge_reasoning_metadata(
+                    &conn,
+                    &log.request_id,
+                    &existing_semantic,
+                    &semantic,
+                )?;
                 return Ok(());
             }
             Some(_) => {
@@ -152,8 +171,14 @@ impl<'a> UsageLogger<'a> {
                     Self::load_existing_semantic(&conn, &fallback)?
                 {
                     if data_source.as_deref().unwrap_or("proxy") == "proxy"
-                        && existing_semantic == semantic
+                        && existing_semantic.matches_except_reasoning(&semantic)
                     {
+                        Self::merge_reasoning_metadata(
+                            &conn,
+                            &fallback,
+                            &existing_semantic,
+                            &semantic,
+                        )?;
                         return Ok(());
                     }
                     return Err(AppError::Database(format!(
@@ -223,6 +248,28 @@ impl<'a> UsageLogger<'a> {
             crate::usage_events::notify_log_recorded();
         }
 
+        Ok(())
+    }
+
+    fn merge_reasoning_metadata(
+        conn: &rusqlite::Connection,
+        request_id: &str,
+        existing: &UsageSemantic,
+        incoming: &UsageSemantic,
+    ) -> Result<(), AppError> {
+        let merged = existing
+            .reasoning_output_tokens
+            .max(incoming.reasoning_output_tokens);
+        if merged == existing.reasoning_output_tokens {
+            return Ok(());
+        }
+
+        conn.execute(
+            "UPDATE proxy_request_logs SET reasoning_output_tokens = ?2 WHERE request_id = ?1",
+            rusqlite::params![request_id, merged],
+        )
+        .map_err(|error| AppError::Database(format!("更新 reasoning token 失败: {error}")))?;
+        crate::usage_events::notify_log_recorded();
         Ok(())
     }
 
@@ -617,6 +664,60 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(count, 1);
+        assert_eq!(crate::usage_events::take_test_notify_count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn reasoning_metadata_enrichment_updates_without_duplicate() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let logger = UsageLogger::new(&db);
+        crate::usage_events::take_test_notify_count();
+        let first = request_log("reasoning-enrichment", 10);
+        let mut enriched = first.clone();
+        enriched.usage.reasoning_output_tokens = 516;
+        let mut corrected = enriched.clone();
+        corrected.usage.reasoning_output_tokens = 1034;
+
+        logger.log_request(&first)?;
+        logger.log_request(&enriched)?;
+        logger.log_request(&corrected)?;
+
+        let conn = crate::database::lock_conn!(db.conn);
+        let (count, reasoning): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), reasoning_output_tokens FROM proxy_request_logs
+             WHERE request_id = 'reasoning-enrichment'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(count, 1);
+        assert_eq!(reasoning, 1034);
+        assert_eq!(crate::usage_events::take_test_notify_count(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_reasoning_replay_keeps_existing_metadata() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let logger = UsageLogger::new(&db);
+        crate::usage_events::take_test_notify_count();
+        let mut first = request_log("reasoning-preserved", 10);
+        first.usage.reasoning_output_tokens = 1034;
+        let mut replay = first.clone();
+        replay.usage.reasoning_output_tokens = 0;
+
+        logger.log_request(&first)?;
+        logger.log_request(&replay)?;
+
+        let conn = crate::database::lock_conn!(db.conn);
+        let (count, reasoning): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), reasoning_output_tokens FROM proxy_request_logs
+             WHERE request_id = 'reasoning-preserved'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(count, 1);
+        assert_eq!(reasoning, 1034);
         assert_eq!(crate::usage_events::take_test_notify_count(), 1);
         Ok(())
     }
