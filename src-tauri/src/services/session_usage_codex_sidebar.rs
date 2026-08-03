@@ -427,10 +427,10 @@ mod tests {
     fn skips_zero_and_incomplete_events_without_estimation() -> Result<(), AppError> {
         let dir = tempdir().unwrap();
         let path = dir.path().join("sidebar.jsonl");
-        append_value(
-            &path,
-            &event("codex_sidebar:usage-v1:thread-side:turn-side:1", 0, 0, 0),
-        );
+        let mut zero = event("codex_sidebar:usage-v1:thread-side:turn-side:1", 0, 0, 0);
+        zero["usage"]["cachedInputTokens"] = serde_json::json!(0);
+        zero["usage"]["cacheWriteInputTokens"] = serde_json::json!(0);
+        append_value(&path, &zero);
         let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
         write!(file, "{{\"schemaVersion\":1").unwrap();
 
