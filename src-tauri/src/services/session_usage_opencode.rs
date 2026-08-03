@@ -344,6 +344,7 @@ fn insert_opencode_message(
         reasoning_output_tokens: 0,
         cache_read_tokens: msg.cache_read_tokens,
         cache_creation_tokens: msg.cache_write_tokens,
+        cache_creation_tokens_known: true,
         created_at,
     };
     if should_skip_session_insert(&conn, request_id, &dedup_key)? {

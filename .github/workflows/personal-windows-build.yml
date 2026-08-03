@@ -47,9 +47,21 @@ jobs:
         working-directory: src-tauri
         run: cargo fmt --all -- --check
 
+      - name: Codex bridge format check
+        working-directory: codex-bridge
+        run: cargo fmt -- --check
+
       - name: Rust tests
         working-directory: src-tauri
         run: cargo test
+
+      - name: Codex bridge tests
+        working-directory: codex-bridge
+        run: cargo test
+
+      - name: Build Codex sidebar usage bridge
+        working-directory: codex-bridge
+        run: cargo build --release
 
       - name: Build unsigned NSIS bundle
         run: pnpm tauri build --bundles nsis --config .github/tauri.personal.conf.json
@@ -61,4 +73,5 @@ jobs:
           path: |
             src-tauri/target/release/bundle/nsis/*.exe
             src-tauri/target/release/cc-switch.exe
+            codex-bridge/target/release/cc-switch-codex-bridge.exe
           if-no-files-found: error

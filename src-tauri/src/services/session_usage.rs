@@ -78,6 +78,11 @@ pub fn sync_all_unlocked(db: &Database) -> SessionSyncResult {
     );
     merge_sync_step(
         &mut result,
+        "Codex Sidebar",
+        crate::services::session_usage_codex_sidebar::sync_codex_sidebar_usage(db),
+    );
+    merge_sync_step(
+        &mut result,
         "Gemini",
         crate::services::session_usage_gemini::sync_gemini_usage(db),
     );
@@ -508,6 +513,7 @@ fn insert_session_log_entry(
         reasoning_output_tokens: 0,
         cache_read_tokens: msg.cache_read_tokens,
         cache_creation_tokens: msg.cache_creation_tokens,
+        cache_creation_tokens_known: true,
         created_at,
     };
     if should_skip_session_insert(&conn, request_id, &dedup_key)? {
