@@ -191,6 +191,12 @@ struct CachedReplayPrefix {
     prefix: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObservedFileStamp {
+    modified: i64,
+    size: u64,
+}
+
 #[derive(Debug)]
 struct ParsedTokenEvent {
     line_offset: i64,
@@ -238,6 +244,7 @@ struct CodexReplayCaches {
     parent_timelines: HashMap<PathBuf, CachedParentTimeline>,
     replay_prefixes: HashMap<PathBuf, CachedReplayPrefix>,
     pending: HashMap<PathBuf, PendingEntry>,
+    observed_files: HashMap<PathBuf, ObservedFileStamp>,
 }
 
 static CODEX_REPLAY_CACHES: OnceLock<Mutex<CodexReplayCaches>> = OnceLock::new();
@@ -249,6 +256,40 @@ fn replay_caches() -> &'static Mutex<CodexReplayCaches> {
 pub(crate) fn clear_codex_replay_caches() {
     if let Ok(mut caches) = replay_caches().lock() {
         *caches = CodexReplayCaches::default();
+    }
+}
+
+fn changed_since_last_codex_scan(
+    file_path: &Path,
+    modified: i64,
+    size: u64,
+    last_modified: i64,
+) -> bool {
+    if modified > last_modified {
+        return true;
+    }
+
+    let current = ObservedFileStamp { modified, size };
+    let Ok(mut caches) = replay_caches().lock() else {
+        return false;
+    };
+    match caches.observed_files.get(file_path) {
+        Some(previous) => previous != &current,
+        None => {
+            caches
+                .observed_files
+                .insert(file_path.to_path_buf(), current);
+            false
+        }
+    }
+}
+
+fn remember_codex_file_scan(file_path: &Path, modified: i64, size: u64) {
+    if let Ok(mut caches) = replay_caches().lock() {
+        caches.observed_files.insert(
+            file_path.to_path_buf(),
+            ObservedFileStamp { modified, size },
+        );
     }
 }
 
@@ -1068,8 +1109,10 @@ fn sync_single_codex_file(
     // 检查同步状态
     let (last_modified, last_offset) = get_codex_sync_state(db, file_path)?;
 
-    // 文件未变化则跳过
-    if file_modified <= last_modified {
+    // Windows 上持续打开的 rollout 在追加期间可能只增长文件长度，而 mtime
+    // 直到写句柄关闭才变化。不能只依赖 mtime，否则同一会话后续 token_count
+    // 会一直等到文件关闭才批量导入。
+    if !changed_since_last_codex_scan(file_path, file_modified, file_size, last_modified) {
         return Ok(CodexFileSyncResult::default());
     }
 
@@ -1103,6 +1146,7 @@ fn sync_single_codex_file(
     let parsed = parse_codex_file(file_path, thread_id_from_filename(file_path))?;
     if !parsed.has_billable_tokens {
         update_sync_state(db, &file_path_str, file_modified, parsed.line_offset)?;
+        remember_codex_file_scan(file_path, file_modified, file_size);
         return Ok(CodexFileSyncResult::default());
     }
     let Some(root_thread_id) = parsed.root_thread_id.as_deref() else {
@@ -1230,6 +1274,7 @@ fn sync_single_codex_file(
     }
 
     update_sync_state(db, &file_path_str, file_modified, parsed.line_offset)?;
+    remember_codex_file_scan(file_path, file_modified, file_size);
     Ok(result)
 }
 
@@ -1366,6 +1411,7 @@ fn find_codex_pricing(conn: &rusqlite::Connection, model_id: &str) -> Option<Mod
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use tempfile::tempdir;
 
     const PARENT_ID: &str = "00000000-0000-4000-8000-000000000001";
@@ -1608,6 +1654,56 @@ mod tests {
     fn test_collect_codex_session_files_nonexistent() {
         let files = collect_codex_session_files(Path::new("/nonexistent/path"));
         assert!(files.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_append_with_unchanged_mtime_imports_new_token_count() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let rollout = rollout_path(temp.path(), CHILD_A_ID);
+        write_jsonl(
+            &rollout,
+            &[
+                session_meta(CHILD_A_ID),
+                turn_context(),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:02Z"),
+            ],
+        );
+
+        assert_eq!(sync_test_file(&db, &rollout, &[&rollout])?.imported, 1);
+        let original_modified = fs::metadata(&rollout).unwrap().modified().unwrap();
+        let original_modified_nanos = metadata_modified_nanos(&fs::metadata(&rollout).unwrap());
+
+        let mut writer = fs::OpenOptions::new().append(true).open(&rollout).unwrap();
+        writeln!(
+            writer,
+            "{}",
+            token_count_at(200, 100, 20, "2026-07-10T03:00:03Z")
+        )
+        .unwrap();
+        writer.flush().unwrap();
+        writer
+            .set_times(fs::FileTimes::new().set_modified(original_modified))
+            .unwrap();
+        drop(writer);
+
+        assert_eq!(
+            metadata_modified_nanos(&fs::metadata(&rollout).unwrap()),
+            original_modified_nanos
+        );
+        assert_eq!(sync_test_file(&db, &rollout, &[&rollout])?.imported, 1);
+        assert_eq!(get_sync_state(&db, &rollout.to_string_lossy())?.1, 4);
+
+        let conn = lock_conn!(db.conn);
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source = 'codex_session'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 2);
+        Ok(())
     }
 
     #[test]
