@@ -258,8 +258,10 @@ fn insert_gemini_session_entry(
         model,
         input_tokens: tokens.input,
         output_tokens,
+        reasoning_output_tokens: 0,
         cache_read_tokens: tokens.cached,
         cache_creation_tokens: 0,
+        cache_creation_tokens_known: false,
         created_at,
     };
     if should_skip_session_insert(&conn, request_id, &dedup_key)? {
@@ -270,6 +272,7 @@ fn insert_gemini_session_entry(
     let usage = TokenUsage {
         input_tokens: tokens.input,
         output_tokens,
+        reasoning_output_tokens: 0,
         cache_read_tokens: tokens.cached,
         cache_creation_tokens: 0,
         model: Some(model.to_string()),

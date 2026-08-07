@@ -341,8 +341,10 @@ fn insert_opencode_message(
         model: &msg.model_id,
         input_tokens: msg.input_tokens,
         output_tokens: output_with_reasoning,
+        reasoning_output_tokens: 0,
         cache_read_tokens: msg.cache_read_tokens,
         cache_creation_tokens: msg.cache_write_tokens,
+        cache_creation_tokens_known: true,
         created_at,
     };
     if should_skip_session_insert(&conn, request_id, &dedup_key)? {
@@ -366,6 +368,7 @@ fn insert_opencode_message(
             let usage = TokenUsage {
                 input_tokens: msg.input_tokens,
                 output_tokens: output_with_reasoning,
+                reasoning_output_tokens: 0,
                 cache_read_tokens: msg.cache_read_tokens,
                 cache_creation_tokens: msg.cache_write_tokens,
                 model: Some(msg.model_id.clone()),
