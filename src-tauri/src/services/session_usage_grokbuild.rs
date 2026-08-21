@@ -799,10 +799,12 @@ mod tests {
         assert_eq!(reasoning, 518);
         // output 保持上游原值（已含 reasoning），不叠加
         assert_eq!(output, 800);
+        drop(conn);
 
         // 重扫幂等：UPSERT 不产生第二行，也不改变数值
         let result = sync_single_grok_file(&db, &path)?;
         assert_eq!(result.imported, 0);
+        let conn = lock_conn!(db.conn);
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source = 'grok_session'",
             [],
