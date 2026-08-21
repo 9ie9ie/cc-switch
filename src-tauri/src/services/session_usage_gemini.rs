@@ -21,7 +21,9 @@ use crate::proxy::usage::parser::TokenUsage;
 use crate::services::session_usage::{
     get_sync_state, metadata_modified_nanos, update_sync_state, SessionSyncResult,
 };
-use crate::services::usage_stats::{find_model_pricing, should_skip_session_insert, DedupKey};
+use crate::services::usage_stats::{
+    find_model_pricing, merge_reasoning_into_matching_proxy_log, DedupKey,
+};
 use rust_decimal::Decimal;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -258,11 +260,16 @@ fn insert_gemini_session_entry(
         model,
         input_tokens: tokens.input,
         output_tokens,
+        reasoning_output_tokens: tokens.thoughts,
         cache_read_tokens: tokens.cached,
         cache_creation_tokens: 0,
+        cache_creation_tokens_known: false,
         created_at,
     };
-    if should_skip_session_insert(&conn, request_id, &dedup_key)? {
+    // Gemini 全量重读会以相同 request_id 带来更新后的 token 计数（如 thoughts
+    // 逐步增长），必须落入下方 UPSERT 刷新，因此这里只做 proxy 指纹去重，
+    // 不按 request_id 已存在而短路；UPSERT 自带的 WHERE 保证无变化时零写入。
+    if merge_reasoning_into_matching_proxy_log(&conn, &dedup_key)? {
         return Ok(false);
     }
 
@@ -270,6 +277,8 @@ fn insert_gemini_session_entry(
     let usage = TokenUsage {
         input_tokens: tokens.input,
         output_tokens,
+        // thoughts 是真实 usage 字段，单独记录用于展示；output 已含思考，费用不变。
+        reasoning_output_tokens: tokens.thoughts,
         cache_read_tokens: tokens.cached,
         cache_creation_tokens: 0,
         model: Some(model.to_string()),
@@ -303,15 +312,17 @@ fn insert_gemini_session_entry(
     conn.execute(
         "INSERT INTO proxy_request_logs (
             request_id, provider_id, app_type, model, request_model,
-            input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+            input_tokens, output_tokens, reasoning_output_tokens,
+            cache_read_tokens, cache_creation_tokens,
             input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
             latency_ms, first_token_ms, status_code, error_message, session_id,
             provider_type, is_streaming, cost_multiplier, created_at, data_source
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
         ON CONFLICT(request_id) DO UPDATE SET
             model = excluded.model,
             input_tokens = excluded.input_tokens,
             output_tokens = excluded.output_tokens,
+            reasoning_output_tokens = excluded.reasoning_output_tokens,
             cache_read_tokens = excluded.cache_read_tokens,
             input_cost_usd = excluded.input_cost_usd,
             output_cost_usd = excluded.output_cost_usd,
@@ -320,6 +331,7 @@ fn insert_gemini_session_entry(
             total_cost_usd = excluded.total_cost_usd
         WHERE input_tokens != excluded.input_tokens
            OR output_tokens != excluded.output_tokens
+           OR reasoning_output_tokens != excluded.reasoning_output_tokens
            OR cache_read_tokens != excluded.cache_read_tokens
            OR model != excluded.model",
         rusqlite::params![
@@ -330,6 +342,7 @@ fn insert_gemini_session_entry(
             model,               // request_model = model
             tokens.input,
             output_tokens,
+            tokens.thoughts,
             tokens.cached,
             0i64,                // cache_creation_tokens
             input_cost,
@@ -422,6 +435,13 @@ mod tests {
             row.get(0)
         })?;
         assert_eq!(count, 1);
+        let reasoning: i64 = conn.query_row(
+            "SELECT reasoning_output_tokens FROM proxy_request_logs
+             WHERE request_id = 'gemini-proxy'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(reasoning, 5);
 
         Ok(())
     }
@@ -443,6 +463,84 @@ mod tests {
         assert_eq!(tokens.thoughts, 405);
         // output + thoughts = 29 + 405 = 434（用于计费）
         assert_eq!(tokens.output + tokens.thoughts, 434);
+    }
+
+    #[test]
+    fn test_insert_gemini_session_stores_reasoning_tokens() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let tokens = GeminiTokens {
+            input: 100,
+            output: 30,
+            cached: 10,
+            thoughts: 70,
+        };
+
+        assert!(insert_gemini_session_entry(
+            &db,
+            "gemini-session-reasoning",
+            &tokens,
+            "gemini-3.6-flash",
+            Some("session-reasoning"),
+            Some("1970-01-01T00:16:40Z"),
+        )?);
+
+        let conn = lock_conn!(db.conn);
+        let (reasoning, output): (i64, i64) = conn.query_row(
+            "SELECT reasoning_output_tokens, output_tokens FROM proxy_request_logs
+             WHERE request_id = 'gemini-session-reasoning'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        // thoughts 单独记录；output = output + thoughts（费用口径不变）
+        assert_eq!(reasoning, 70);
+        assert_eq!(output, 100);
+        Ok(())
+    }
+
+    #[test]
+    fn test_insert_gemini_session_upsert_updates_reasoning_tokens() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let first = GeminiTokens {
+            input: 100,
+            output: 30,
+            cached: 10,
+            thoughts: 0,
+        };
+        assert!(insert_gemini_session_entry(
+            &db,
+            "gemini-session-upsert-reasoning",
+            &first,
+            "gemini-3.6-flash",
+            Some("session-upsert"),
+            Some("1970-01-01T00:16:40Z"),
+        )?);
+
+        // 全量重读携带更新后的 thoughts：UPSERT 必须刷新 reasoning 列。
+        let updated = GeminiTokens {
+            input: 100,
+            output: 30,
+            cached: 10,
+            thoughts: 518,
+        };
+        insert_gemini_session_entry(
+            &db,
+            "gemini-session-upsert-reasoning",
+            &updated,
+            "gemini-3.6-flash",
+            Some("session-upsert"),
+            Some("1970-01-01T00:16:40Z"),
+        )?;
+
+        let conn = lock_conn!(db.conn);
+        let (count, reasoning): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), MAX(reasoning_output_tokens) FROM proxy_request_logs
+             WHERE request_id = 'gemini-session-upsert-reasoning'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(count, 1);
+        assert_eq!(reasoning, 518);
+        Ok(())
     }
 
     #[test]

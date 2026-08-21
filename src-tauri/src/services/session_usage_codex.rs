@@ -49,6 +49,7 @@ struct CumulativeTokens {
     input: u64,
     cached_input: u64,
     output: u64,
+    reasoning_output: u64,
 }
 
 /// 单次 API 调用的 token 增量
@@ -57,11 +58,12 @@ struct DeltaTokens {
     input: u32,
     cached_input: u32,
     output: u32,
+    reasoning_output: u32,
 }
 
 impl DeltaTokens {
     fn is_zero(&self) -> bool {
-        self.input == 0 && self.cached_input == 0 && self.output == 0
+        self.input == 0 && self.cached_input == 0 && self.output == 0 && self.reasoning_output == 0
     }
 }
 
@@ -189,6 +191,12 @@ struct CachedReplayPrefix {
     prefix: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObservedFileStamp {
+    modified: i64,
+    size: u64,
+}
+
 #[derive(Debug)]
 struct ParsedTokenEvent {
     line_offset: i64,
@@ -236,6 +244,7 @@ struct CodexReplayCaches {
     parent_timelines: HashMap<PathBuf, CachedParentTimeline>,
     replay_prefixes: HashMap<PathBuf, CachedReplayPrefix>,
     pending: HashMap<PathBuf, PendingEntry>,
+    observed_files: HashMap<PathBuf, ObservedFileStamp>,
 }
 
 static CODEX_REPLAY_CACHES: OnceLock<Mutex<CodexReplayCaches>> = OnceLock::new();
@@ -247,6 +256,40 @@ fn replay_caches() -> &'static Mutex<CodexReplayCaches> {
 pub(crate) fn clear_codex_replay_caches() {
     if let Ok(mut caches) = replay_caches().lock() {
         *caches = CodexReplayCaches::default();
+    }
+}
+
+fn changed_since_last_codex_scan(
+    file_path: &Path,
+    modified: i64,
+    size: u64,
+    last_modified: i64,
+) -> bool {
+    if modified > last_modified {
+        return true;
+    }
+
+    let current = ObservedFileStamp { modified, size };
+    let Ok(mut caches) = replay_caches().lock() else {
+        return true;
+    };
+    match caches.observed_files.get(file_path) {
+        Some(previous) => previous != &current,
+        None => {
+            caches
+                .observed_files
+                .insert(file_path.to_path_buf(), current);
+            false
+        }
+    }
+}
+
+fn remember_codex_file_scan(file_path: &Path, modified: i64, size: u64) {
+    if let Ok(mut caches) = replay_caches().lock() {
+        caches.observed_files.insert(
+            file_path.to_path_buf(),
+            ObservedFileStamp { modified, size },
+        );
     }
 }
 
@@ -422,8 +465,27 @@ fn parse_timestamp(value: Option<&serde_json::Value>) -> Option<DateTime<Utc>> {
         .map(|value| value.with_timezone(&Utc))
 }
 
+fn reasoning_output_tokens(value: &serde_json::Value) -> Option<u64> {
+    value
+        .get("reasoning_output_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            value
+                .get("output_tokens_details")
+                .and_then(|details| details.get("reasoning_tokens"))
+                .and_then(serde_json::Value::as_u64)
+        })
+        .or_else(|| {
+            value
+                .get("completion_tokens_details")
+                .and_then(|details| details.get("reasoning_tokens"))
+                .and_then(serde_json::Value::as_u64)
+        })
+}
+
 fn parse_signature_counters(value: Option<&serde_json::Value>) -> Option<TokenCountersSignature> {
-    let value = value?.as_object()?;
+    let usage = value?;
+    let value = usage.as_object()?;
     Some(TokenCountersSignature {
         input: value
             .get("input_tokens")
@@ -435,9 +497,7 @@ fn parse_signature_counters(value: Option<&serde_json::Value>) -> Option<TokenCo
         output: value
             .get("output_tokens")
             .and_then(serde_json::Value::as_u64),
-        reasoning_output: value
-            .get("reasoning_output_tokens")
-            .and_then(serde_json::Value::as_u64),
+        reasoning_output: reasoning_output_tokens(usage),
         total: value
             .get("total_tokens")
             .and_then(serde_json::Value::as_u64),
@@ -590,11 +650,13 @@ fn compute_delta(prev: &Option<CumulativeTokens>, current: &CumulativeTokens) ->
             input: current.input as u32,
             cached_input: current.cached_input as u32,
             output: current.output as u32,
+            reasoning_output: current.reasoning_output as u32,
         },
         Some(p) => DeltaTokens {
             input: current.input.saturating_sub(p.input) as u32,
             cached_input: current.cached_input.saturating_sub(p.cached_input) as u32,
             output: current.output.saturating_sub(p.output) as u32,
+            reasoning_output: current.reasoning_output.saturating_sub(p.reasoning_output) as u32,
         },
     }
 }
@@ -603,6 +665,7 @@ fn update_high_water(high_water: &mut CumulativeTokens, current: &CumulativeToke
     high_water.input = high_water.input.max(current.input);
     high_water.cached_input = high_water.cached_input.max(current.cached_input);
     high_water.output = high_water.output.max(current.output);
+    high_water.reasoning_output = high_water.reasoning_output.max(current.reasoning_output);
 }
 
 /// 从 JSON Value 中提取累计 token 用量
@@ -635,6 +698,7 @@ fn parse_cumulative_tokens(total_usage: &serde_json::Value) -> Option<Cumulative
             .get("output_tokens")
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
+        reasoning_output: reasoning_output_tokens(total_usage).unwrap_or(0),
     })
 }
 
@@ -905,6 +969,7 @@ fn parse_codex_file(
                         input: 0,
                         cached_input: 0,
                         output: 0,
+                        reasoning_output: 0,
                     }
                 } else if let Some(last) = last {
                     // Codex provides the exact per-request usage. Prefer it to
@@ -914,6 +979,7 @@ fn parse_codex_file(
                         input: last.input as u32,
                         cached_input: last.cached_input as u32,
                         output: last.output as u32,
+                        reasoning_output: last.reasoning_output as u32,
                     }
                 } else if let Some(total) = total.as_ref() {
                     compute_delta(&total_high_water, total)
@@ -1147,8 +1213,10 @@ fn sync_single_codex_file(
     // 检查同步状态
     let (last_modified, last_offset) = get_codex_sync_state(db, file_path, &pass.cursors)?;
 
-    // 文件未变化则跳过
-    if file_modified <= last_modified {
+    // Windows 上持续打开的 rollout 在追加期间可能只增长文件长度，而 mtime
+    // 直到写句柄关闭才变化。不能只依赖 mtime，否则同一会话后续 token_count
+    // 会一直等到文件关闭才批量导入。
+    if !changed_since_last_codex_scan(file_path, file_modified, file_size, last_modified) {
         return Ok(CodexFileSyncResult::default());
     }
 
@@ -1182,6 +1250,7 @@ fn sync_single_codex_file(
     let parsed = parse_codex_file(file_path, thread_id_from_filename(file_path))?;
     if !parsed.has_billable_tokens {
         update_sync_state(db, &file_path_str, file_modified, parsed.line_offset)?;
+        remember_codex_file_scan(file_path, file_modified, file_size);
         return Ok(CodexFileSyncResult::default());
     }
     let Some(root_thread_id) = parsed.root_thread_id.as_deref() else {
@@ -1344,6 +1413,7 @@ fn sync_single_codex_file(
     if to_insert.is_empty() {
         update_sync_state(db, &file_path_str, file_modified, parsed.line_offset)?;
     }
+    remember_codex_file_scan(file_path, file_modified, file_size);
     Ok(result)
 }
 
@@ -1406,8 +1476,10 @@ fn insert_codex_session_entry_on_conn(
         model,
         input_tokens: delta.input,
         output_tokens: delta.output,
+        reasoning_output_tokens: delta.reasoning_output,
         cache_read_tokens: delta.cached_input,
         cache_creation_tokens: 0,
+        cache_creation_tokens_known: false,
         created_at,
     };
     if should_skip_session_insert(conn, request_id, &dedup_key)? {
@@ -1427,6 +1499,7 @@ fn insert_codex_session_entry_on_conn(
     let usage = TokenUsage {
         input_tokens: delta.input,
         output_tokens: delta.output,
+        reasoning_output_tokens: delta.reasoning_output,
         cache_read_tokens: delta.cached_input,
         cache_creation_tokens: 0,
         model: Some(model.to_string()),
@@ -1462,11 +1535,11 @@ fn insert_codex_session_entry_on_conn(
         .prepare_cached(
             "INSERT OR IGNORE INTO proxy_request_logs (
             request_id, provider_id, app_type, model, request_model,
-            input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+            input_tokens, output_tokens, reasoning_output_tokens, cache_read_tokens, cache_creation_tokens,
             input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
             latency_ms, first_token_ms, status_code, error_message, session_id,
             provider_type, is_streaming, cost_multiplier, created_at, data_source
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
         )
         .and_then(|mut stmt| stmt.execute(rusqlite::params![
                 request_id,
@@ -1476,6 +1549,7 @@ fn insert_codex_session_entry_on_conn(
                 model,               // request_model = model
                 delta.input,
                 delta.output,
+                delta.reasoning_output,
                 delta.cached_input,
                 0i64,                // cache_creation_tokens: Codex 日志无此数据
                 input_cost,
@@ -1508,6 +1582,7 @@ fn find_codex_pricing(conn: &rusqlite::Connection, model_id: &str) -> Option<Mod
 mod tests {
     use super::*;
     use crate::services::session_usage::get_sync_state;
+    use std::io::Write;
     use tempfile::tempdir;
 
     const PARENT_ID: &str = "00000000-0000-4000-8000-000000000001";
@@ -1662,6 +1737,7 @@ mod tests {
             input: 17934,
             cached_input: 9600,
             output: 454,
+            reasoning_output: 0,
         };
         let delta = compute_delta(&prev, &current);
         assert_eq!(delta.input, 17934);
@@ -1676,11 +1752,13 @@ mod tests {
             input: 17934,
             cached_input: 9600,
             output: 454,
+            reasoning_output: 0,
         });
         let current = CumulativeTokens {
             input: 36722,
             cached_input: 27904,
             output: 804,
+            reasoning_output: 0,
         };
         let delta = compute_delta(&prev, &current);
         assert_eq!(delta.input, 36722 - 17934);
@@ -1694,12 +1772,14 @@ mod tests {
             input: 58346,
             cached_input: 46976,
             output: 1045,
+            reasoning_output: 0,
         });
         // task 边界：相同的累计值
         let current = CumulativeTokens {
             input: 58346,
             cached_input: 46976,
             output: 1045,
+            reasoning_output: 0,
         };
         let delta = compute_delta(&prev, &current);
         assert!(delta.is_zero());
@@ -1712,16 +1792,19 @@ mod tests {
             input: 100,
             cached_input: 50,
             output: 30,
+            reasoning_output: 10,
         });
         let current = CumulativeTokens {
             input: 80,
             cached_input: 40,
             output: 20,
+            reasoning_output: 5,
         };
         let delta = compute_delta(&prev, &current);
         assert_eq!(delta.input, 0);
         assert_eq!(delta.cached_input, 0);
         assert_eq!(delta.output, 0);
+        assert_eq!(delta.reasoning_output, 0);
         assert!(delta.is_zero());
     }
 
@@ -2162,6 +2245,7 @@ mod tests {
         assert_eq!(tokens.input, 17934);
         assert_eq!(tokens.cached_input, 9600);
         assert_eq!(tokens.output, 454);
+        assert_eq!(tokens.reasoning_output, 233);
     }
 
     #[test]
@@ -2187,16 +2271,88 @@ mod tests {
         let json: serde_json::Value = serde_json::json!({
             "input_tokens": 1000,
             "cache_read_input_tokens": 500,
-            "output_tokens": 200
+            "output_tokens": 200,
+            "output_tokens_details": {
+                "reasoning_tokens": 516
+            }
         });
         let tokens = parse_cumulative_tokens(&json).unwrap();
         assert_eq!(tokens.cached_input, 500);
+        assert_eq!(tokens.reasoning_output, 516);
+    }
+
+    #[test]
+    fn test_delta_includes_reasoning_output_tokens() {
+        let prev = Some(CumulativeTokens {
+            input: 100,
+            cached_input: 40,
+            output: 20,
+            reasoning_output: 5,
+        });
+        let current = CumulativeTokens {
+            input: 150,
+            cached_input: 60,
+            output: 80,
+            reasoning_output: 35,
+        };
+        let delta = compute_delta(&prev, &current);
+        assert_eq!(delta.reasoning_output, 30);
     }
 
     #[test]
     fn test_collect_codex_session_files_nonexistent() {
         let files = collect_codex_session_files(Path::new("/nonexistent/path"));
         assert!(files.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_append_with_unchanged_mtime_imports_new_token_count() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let rollout = rollout_path(temp.path(), CHILD_A_ID);
+        write_jsonl(
+            &rollout,
+            &[
+                session_meta(CHILD_A_ID),
+                turn_context(),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:02Z"),
+            ],
+        );
+
+        assert_eq!(sync_test_file(&db, &rollout, &[&rollout])?.imported, 1);
+        let original_modified = fs::metadata(&rollout).unwrap().modified().unwrap();
+        let original_modified_nanos = metadata_modified_nanos(&fs::metadata(&rollout).unwrap());
+
+        let mut writer = fs::OpenOptions::new().append(true).open(&rollout).unwrap();
+        writeln!(
+            writer,
+            "{}",
+            token_count_at(200, 100, 20, "2026-07-10T03:00:03Z")
+        )
+        .unwrap();
+        writer.flush().unwrap();
+        writer
+            .set_times(fs::FileTimes::new().set_modified(original_modified))
+            .unwrap();
+        drop(writer);
+
+        assert_eq!(
+            metadata_modified_nanos(&fs::metadata(&rollout).unwrap()),
+            original_modified_nanos
+        );
+        assert_eq!(sync_test_file(&db, &rollout, &[&rollout])?.imported, 1);
+        assert_eq!(get_sync_state(&db, &rollout.to_string_lossy())?.1, 4);
+
+        let conn = lock_conn!(db.conn);
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source = 'codex_session'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 2);
+        Ok(())
     }
 
     #[test]
@@ -2766,6 +2922,7 @@ mod tests {
             input: 10,
             cached_input: 1,
             output: 2,
+            reasoning_output: 0,
         };
         let mut suspected_duplicates = 0;
         let inserted = insert_codex_session_entry(
@@ -2795,6 +2952,7 @@ mod tests {
             input: 10,
             cached_input: 1,
             output: 2,
+            reasoning_output: 0,
         };
         let mut suspected_duplicates = 0;
         assert!(insert_codex_session_entry(
@@ -2824,6 +2982,38 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(count, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_insert_codex_session_stores_reasoning_tokens() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let delta = DeltaTokens {
+            input: 100,
+            cached_input: 20,
+            output: 800,
+            reasoning_output: 516,
+        };
+        let mut suspected_duplicates = 0;
+
+        assert!(insert_codex_session_entry(
+            &db,
+            "codex-session-reasoning",
+            &delta,
+            "gpt-5.6",
+            Some("session-reasoning"),
+            Some("1970-01-01T00:20:00Z"),
+            &mut suspected_duplicates,
+        )?);
+
+        let conn = lock_conn!(db.conn);
+        let reasoning: i64 = conn.query_row(
+            "SELECT reasoning_output_tokens FROM proxy_request_logs
+             WHERE request_id = 'codex-session-reasoning'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(reasoning, 516);
         Ok(())
     }
 
@@ -2956,11 +3146,13 @@ mod tests {
             input: 100,
             cached_input: 0,
             output: 50,
+            reasoning_output: 0,
         });
         let current = CumulativeTokens {
             input: 110,       // delta = 10
             cached_input: 80, // delta = 80（异常：大于 input delta）
             output: 60,
+            reasoning_output: 0,
         };
         let delta = compute_delta(&prev, &current);
         // 钳制前：cached_input = 80, input = 10
