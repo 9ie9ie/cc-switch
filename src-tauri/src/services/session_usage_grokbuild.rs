@@ -63,6 +63,8 @@ struct GrokCounters {
     input: u64,
     output: u64,
     cached: u64,
+    /// `reasoningTokens` ⊂ `outputTokens`，仅作展示，不参与计费
+    reasoning: u64,
     api_ms: u64,
     model_calls: u64,
     /// CLI 自报本轮成本，1 tick = 1e-10 USD；0 = 上游未提供
@@ -381,6 +383,7 @@ fn parse_grok_counters(value: &serde_json::Value) -> GrokCounters {
         input: get("inputTokens"),
         output: get("outputTokens"),
         cached: get("cachedReadTokens"),
+        reasoning: get("reasoningTokens"),
         api_ms: get("apiDurationMs"),
         model_calls: get("modelCalls"),
         cost_ticks: get("costUsdTicks"),
@@ -421,6 +424,8 @@ fn insert_grok_session_entry(
     let usage = TokenUsage {
         input_tokens: clamp(turn.input),
         output_tokens: clamp(turn.output),
+        // reasoningTokens ⊂ outputTokens：单独记录用于展示，费用仍按 output 全额。
+        reasoning_output_tokens: clamp(turn.reasoning),
         cache_read_tokens: clamp(turn.cached),
         cache_creation_tokens: 0,
         model: Some(model.to_string()),
@@ -514,16 +519,18 @@ fn insert_grok_session_entry(
     conn.execute(
         "INSERT INTO proxy_request_logs (
             request_id, provider_id, app_type, model, request_model,
-            input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+            input_tokens, output_tokens, reasoning_output_tokens,
+            cache_read_tokens, cache_creation_tokens,
             input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
             latency_ms, first_token_ms, status_code, error_message, session_id,
             provider_type, is_streaming, cost_multiplier, created_at, data_source,
             input_token_semantics
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
         ON CONFLICT(request_id) DO UPDATE SET
             model = excluded.model,
             input_tokens = excluded.input_tokens,
             output_tokens = excluded.output_tokens,
+            reasoning_output_tokens = excluded.reasoning_output_tokens,
             cache_read_tokens = excluded.cache_read_tokens,
             input_cost_usd = excluded.input_cost_usd,
             output_cost_usd = excluded.output_cost_usd,
@@ -534,6 +541,7 @@ fn insert_grok_session_entry(
         WHERE data_source = 'grok_session'
           AND (input_tokens != excluded.input_tokens
            OR output_tokens != excluded.output_tokens
+           OR reasoning_output_tokens != excluded.reasoning_output_tokens
            OR cache_read_tokens != excluded.cache_read_tokens
            OR latency_ms != excluded.latency_ms
            OR model != excluded.model)",
@@ -545,6 +553,7 @@ fn insert_grok_session_entry(
             model,               // request_model = model
             usage.input_tokens,
             usage.output_tokens,
+            usage.reasoning_output_tokens,
             usage.cache_read_tokens,
             0i64,                // cache_creation_tokens
             input_cost,
@@ -698,6 +707,7 @@ mod tests {
                 input: 16632,
                 output: 104,
                 cached: 0,
+                reasoning: 0,
                 api_ms: 5342,
                 model_calls: 0,
                 cost_ticks: 338_880_000,
@@ -764,6 +774,41 @@ mod tests {
         let expected2 = Decimal::from(56_540_000u64) / Decimal::from(10_000_000_000u64);
         assert_eq!(Decimal::from_str(&costs[0].1).expect("decimal"), expected1);
         assert_eq!(Decimal::from_str(&costs[1].1).expect("decimal"), expected2);
+        Ok(())
+    }
+
+    #[test]
+    fn reasoning_tokens_are_stored_without_stacking_output() -> Result<(), AppError> {
+        // reasoningTokens ⊂ outputTokens：单独入库展示，output/费用不叠加。
+        let db = Database::memory()?;
+        let temp = tempdir().expect("tempdir");
+        let counters = r#""grok-4.5-build":{"inputTokens":1000,"outputTokens":800,"cachedReadTokens":0,"reasoningTokens":518,"apiDurationMs":1200,"costUsdTicks":0}"#;
+        let lines = vec![usage_event_line(OLD_EPOCH, "p1", counters)];
+        let path = write_session_file(temp.path(), "sess-reasoning", &lines);
+
+        let result = sync_single_grok_file(&db, &path)?;
+        assert_eq!(result.imported, 1);
+
+        let conn = lock_conn!(db.conn);
+        let (reasoning, output): (i64, i64) = conn.query_row(
+            "SELECT reasoning_output_tokens, output_tokens FROM proxy_request_logs
+             WHERE data_source = 'grok_session'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(reasoning, 518);
+        // output 保持上游原值（已含 reasoning），不叠加
+        assert_eq!(output, 800);
+
+        // 重扫幂等：UPSERT 不产生第二行，也不改变数值
+        let result = sync_single_grok_file(&db, &path)?;
+        assert_eq!(result.imported, 0);
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source = 'grok_session'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 1);
         Ok(())
     }
 

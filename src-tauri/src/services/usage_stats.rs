@@ -136,6 +136,7 @@ pub struct RequestLogDetail {
     pub cost_multiplier: String,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    pub reasoning_output_tokens: u32,
     pub cache_read_tokens: u32,
     pub cache_creation_tokens: u32,
     /// Internal storage semantics; omitted from the UI/API payload.
@@ -160,15 +161,15 @@ pub struct RequestLogDetail {
     pub pricing_model: Option<String>,
 }
 
-/// 把 26 列的查询结果映射为 `RequestLogDetail`。
+/// 把 27 列的查询结果映射为 `RequestLogDetail`。
 ///
-/// 调用方的 SELECT **必须**按以下顺序返回 26 列：
+/// 调用方的 SELECT **必须**按以下顺序返回 27 列：
 /// `request_id, provider_id, provider_name, app_type, model, request_model,
-///  cost_multiplier, input_tokens, output_tokens, cache_read_tokens,
-///  cache_creation_tokens, input_cost_usd, output_cost_usd, cache_read_cost_usd,
-///  cache_creation_cost_usd, total_cost_usd, is_streaming, latency_ms,
-///  first_token_ms, duration_ms, status_code, error_message, created_at,
-///  data_source, pricing_model, input_token_semantics`
+///  cost_multiplier, input_tokens, output_tokens, reasoning_output_tokens,
+///  cache_read_tokens, cache_creation_tokens, input_cost_usd, output_cost_usd,
+///  cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd, is_streaming,
+///  latency_ms, first_token_ms, duration_ms, status_code, error_message,
+///  created_at, data_source, pricing_model, input_token_semantics`
 ///
 /// 不需要 provider_name 时（如 backfill）SELECT `NULL AS provider_name` 占位即可。
 fn row_to_request_log_detail(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestLogDetail> {
@@ -184,23 +185,24 @@ fn row_to_request_log_detail(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reques
             .unwrap_or_else(|| "1".to_string()),
         input_tokens: row.get::<_, i64>(7)? as u32,
         output_tokens: row.get::<_, i64>(8)? as u32,
-        cache_read_tokens: row.get::<_, i64>(9)? as u32,
-        cache_creation_tokens: row.get::<_, i64>(10)? as u32,
-        input_cost_usd: row.get(11)?,
-        output_cost_usd: row.get(12)?,
-        cache_read_cost_usd: row.get(13)?,
-        cache_creation_cost_usd: row.get(14)?,
-        total_cost_usd: row.get(15)?,
-        is_streaming: row.get::<_, i64>(16)? != 0,
-        latency_ms: row.get::<_, i64>(17)? as u64,
-        first_token_ms: row.get::<_, Option<i64>>(18)?.map(|v| v as u64),
-        duration_ms: row.get::<_, Option<i64>>(19)?.map(|v| v as u64),
-        status_code: row.get::<_, i64>(20)? as u16,
-        error_message: row.get(21)?,
-        created_at: row.get(22)?,
-        data_source: row.get(23)?,
-        pricing_model: row.get(24)?,
-        input_token_semantics: row.get::<_, i64>(25)?,
+        reasoning_output_tokens: row.get::<_, i64>(9)? as u32,
+        cache_read_tokens: row.get::<_, i64>(10)? as u32,
+        cache_creation_tokens: row.get::<_, i64>(11)? as u32,
+        input_cost_usd: row.get(12)?,
+        output_cost_usd: row.get(13)?,
+        cache_read_cost_usd: row.get(14)?,
+        cache_creation_cost_usd: row.get(15)?,
+        total_cost_usd: row.get(16)?,
+        is_streaming: row.get::<_, i64>(17)? != 0,
+        latency_ms: row.get::<_, i64>(18)? as u64,
+        first_token_ms: row.get::<_, Option<i64>>(19)?.map(|v| v as u64),
+        duration_ms: row.get::<_, Option<i64>>(20)?.map(|v| v as u64),
+        status_code: row.get::<_, i64>(21)? as u16,
+        error_message: row.get(22)?,
+        created_at: row.get(23)?,
+        data_source: row.get(24)?,
+        pricing_model: row.get(25)?,
+        input_token_semantics: row.get::<_, i64>(26)?,
     })
 }
 
@@ -213,6 +215,7 @@ fn provider_name_coalesce(log_alias: &str, provider_alias: &str) -> String {
         "COALESCE({provider_alias}.name, CASE {log_alias}.provider_id \
          WHEN '_session' THEN 'Claude (Session)' \
          WHEN '_codex_session' THEN 'Codex (Session)' \
+         WHEN '_codex_sidebar' THEN 'Codex (Sidebar)' \
          WHEN '_gemini_session' THEN 'Gemini (Session)' \
          WHEN '_opencode_session' THEN 'OpenCode (Session)' \
          WHEN '_grok_session' THEN 'Grok Build (Session)' \
@@ -310,7 +313,7 @@ pub(crate) fn effective_usage_log_filter(log_alias: &str) -> String {
         dedup_app_type_match_sql("proxy_dedup.app_type", &format!("{log_alias}.app_type"));
     format!(
         "NOT (
-            {data_source} IN ('session_log', 'codex_session', 'gemini_session', 'opencode_session')
+            {data_source} IN ('session_log', 'codex_session', 'codex_sidebar', 'gemini_session', 'opencode_session')
             AND EXISTS (
                 SELECT 1
                 FROM proxy_request_logs proxy_dedup
@@ -320,6 +323,11 @@ pub(crate) fn effective_usage_log_filter(log_alias: &str) -> String {
                   AND proxy_dedup.status_code < 300
                   AND proxy_dedup.input_tokens = {log_alias}.input_tokens
                   AND proxy_dedup.output_tokens = {log_alias}.output_tokens
+                  AND (
+                      proxy_dedup.reasoning_output_tokens = {log_alias}.reasoning_output_tokens
+                      OR proxy_dedup.reasoning_output_tokens = 0
+                      OR {log_alias}.reasoning_output_tokens = 0
+                  )
                   AND proxy_dedup.cache_read_tokens = {log_alias}.cache_read_tokens
                   AND (
                       proxy_dedup.cache_creation_tokens = {log_alias}.cache_creation_tokens
@@ -344,15 +352,20 @@ pub(crate) fn effective_usage_log_filter(log_alias: &str) -> String {
 /// 跨源去重指纹键。
 ///
 /// `cache_creation_tokens`：Codex/Gemini session 日志不暴露该字段，调用方传 0
-/// 表示"未知"，匹配器会放行 proxy 侧任意 cache_creation_tokens 值。
+/// 且把 `cache_creation_tokens_known` 设为 false，匹配器才会放行 proxy 侧任意值。
+/// `reasoning_output_tokens`：旧日志中的 0 同样视为"未知"，避免重建会话用量时
+/// 因旧代理行缺少该字段而重复计数。
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DedupKey<'a> {
     pub app_type: &'a str,
     pub model: &'a str,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    pub reasoning_output_tokens: u32,
     pub cache_read_tokens: u32,
     pub cache_creation_tokens: u32,
+    /// `false` means a zero cache-write count is unavailable rather than exact.
+    pub cache_creation_tokens_known: bool,
     pub created_at: i64,
 }
 
@@ -383,24 +396,25 @@ static MATCHING_PROXY_USAGE_LOG_SQL: LazyLock<String> = LazyLock::new(|| {
     let l_data_source = data_source_expr("l");
     let app_type_match = dedup_app_type_match_sql("l.app_type", "?1");
     format!(
-        "SELECT EXISTS (
-            SELECT 1
-            FROM proxy_request_logs l
-            WHERE {l_data_source} = 'proxy'
+        "SELECT l.request_id, l.reasoning_output_tokens
+           FROM proxy_request_logs l
+          WHERE {l_data_source} = 'proxy'
               AND {app_type_match}
               AND l.status_code >= 200
               AND l.status_code < 300
               AND l.input_tokens = ?3
               AND l.output_tokens = ?4
-              AND l.cache_read_tokens = ?5
-              AND (l.cache_creation_tokens = ?6 OR ?9 = 1)
-              AND l.created_at BETWEEN ?7 - ?8 AND ?7 + ?8
+              AND (l.reasoning_output_tokens = ?5 OR l.reasoning_output_tokens = 0 OR ?5 = 0)
+              AND l.cache_read_tokens = ?6
+              AND (l.cache_creation_tokens = ?7 OR ?10 = 1)
+              AND l.created_at BETWEEN ?8 - ?9 AND ?8 + ?9
               AND (
                   LOWER(l.model) = LOWER(?2)
                   OR LOWER(l.model) = 'unknown'
                   OR LOWER(?2) = 'unknown'
               )
-        )"
+          ORDER BY ABS(l.created_at - ?8), l.created_at
+          LIMIT 1"
     )
 });
 
@@ -408,8 +422,15 @@ pub(crate) fn has_matching_proxy_usage_log(
     conn: &Connection,
     key: &DedupKey,
 ) -> Result<bool, AppError> {
+    Ok(matching_proxy_usage_log(conn, key)?.is_some())
+}
+
+fn matching_proxy_usage_log(
+    conn: &Connection,
+    key: &DedupKey,
+) -> Result<Option<(String, u32)>, AppError> {
     let allow_missing_cache_creation =
-        matches!(key.app_type, "codex" | "gemini" | "opencode") && key.cache_creation_tokens == 0;
+        !key.cache_creation_tokens_known && key.cache_creation_tokens == 0;
 
     conn.prepare_cached(&MATCHING_PROXY_USAGE_LOG_SQL)
         .and_then(|mut stmt| {
@@ -419,16 +440,50 @@ pub(crate) fn has_matching_proxy_usage_log(
                     key.model,
                     key.input_tokens as i64,
                     key.output_tokens as i64,
+                    key.reasoning_output_tokens as i64,
                     key.cache_read_tokens as i64,
                     key.cache_creation_tokens as i64,
                     key.created_at,
                     SESSION_PROXY_DEDUP_WINDOW_SECONDS,
                     allow_missing_cache_creation as i64,
                 ],
-                |row| row.get::<_, bool>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?.max(0) as u32,
+                    ))
+                },
             )
         })
+        .optional()
         .map_err(|e| AppError::Database(format!("查询重复代理用量日志失败: {e}")))
+}
+
+/// Merge an exact reasoning count into a matching older proxy row before the
+/// session-derived duplicate is skipped. Output-token cost is unchanged because
+/// OpenAI output totals already include reasoning tokens.
+pub(crate) fn merge_reasoning_into_matching_proxy_log(
+    conn: &Connection,
+    key: &DedupKey,
+) -> Result<bool, AppError> {
+    let Some((request_id, existing_reasoning)) = matching_proxy_usage_log(conn, key)? else {
+        return Ok(false);
+    };
+
+    if key.reasoning_output_tokens > existing_reasoning {
+        let updated = conn
+            .execute(
+                "UPDATE proxy_request_logs
+                SET reasoning_output_tokens = ?2
+              WHERE request_id = ?1 AND reasoning_output_tokens < ?2",
+                params![request_id, key.reasoning_output_tokens as i64],
+            )
+            .map_err(|e| AppError::Database(format!("补全重复代理日志推理 token 失败: {e}")))?;
+        if updated > 0 {
+            crate::usage_events::notify_log_recorded();
+        }
+    }
+    Ok(true)
 }
 
 /// grokbuild 会话导入的接管活动守卫：给定时刻 ±窗口内存在任何 grokbuild
@@ -477,8 +532,9 @@ static SUSPECTED_CODEX_DUPLICATE_SQL: LazyLock<String> = LazyLock::new(|| {
               AND LOWER(l.model) = LOWER(?2)
               AND l.input_tokens = ?3
               AND l.output_tokens = ?4
-              AND l.cache_read_tokens = ?5
-              AND l.created_at BETWEEN ?6 - ?7 AND ?6 + ?7
+              AND (l.reasoning_output_tokens = ?5 OR l.reasoning_output_tokens = 0 OR ?5 = 0)
+              AND l.cache_read_tokens = ?6
+              AND l.created_at BETWEEN ?7 - ?8 AND ?7 + ?8
         )"
     )
 });
@@ -496,6 +552,7 @@ pub(crate) fn has_suspected_codex_session_duplicate(
                     key.model,
                     key.input_tokens as i64,
                     key.output_tokens as i64,
+                    key.reasoning_output_tokens as i64,
                     key.cache_read_tokens as i64,
                     key.created_at,
                     SESSION_PROXY_DEDUP_WINDOW_SECONDS,
@@ -1619,7 +1676,8 @@ impl Database {
         let sql = format!(
             "SELECT l.request_id, l.provider_id, {logs_pname} as provider_name, l.app_type, l.model,
                     l.request_model, l.cost_multiplier,
-                    l.input_tokens, l.output_tokens, l.cache_read_tokens, l.cache_creation_tokens,
+                    l.input_tokens, l.output_tokens, l.reasoning_output_tokens,
+                    l.cache_read_tokens, l.cache_creation_tokens,
                     l.input_cost_usd, l.output_cost_usd, l.cache_read_cost_usd, l.cache_creation_cost_usd, l.total_cost_usd,
                     l.is_streaming, l.latency_ms, l.first_token_ms, l.duration_ms,
                     l.status_code, l.error_message, l.created_at, l.data_source, l.pricing_model,
@@ -1663,10 +1721,11 @@ impl Database {
         let detail_sql = format!(
             "SELECT l.request_id, l.provider_id, {detail_pname} as provider_name, l.app_type, l.model,
                     l.request_model, l.cost_multiplier,
-                    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-                    input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
-                    is_streaming, latency_ms, first_token_ms, duration_ms,
-                    status_code, error_message, created_at, l.data_source, l.pricing_model,
+                    l.input_tokens, l.output_tokens, l.reasoning_output_tokens,
+                    l.cache_read_tokens, l.cache_creation_tokens,
+                    l.input_cost_usd, l.output_cost_usd, l.cache_read_cost_usd, l.cache_creation_cost_usd, l.total_cost_usd,
+                    l.is_streaming, l.latency_ms, l.first_token_ms, l.duration_ms,
+                    l.status_code, l.error_message, l.created_at, l.data_source, l.pricing_model,
                     l.input_token_semantics
              FROM proxy_request_logs l
              LEFT JOIN providers p ON l.provider_id = p.id AND l.app_type = p.app_type
@@ -1819,14 +1878,15 @@ impl Database {
         const BASE_SQL: &str =
             "SELECT request_id, provider_id, NULL AS provider_name, app_type, model, request_model,
                         cost_multiplier,
-                        input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                        input_tokens, output_tokens, reasoning_output_tokens,
+                        cache_read_tokens, cache_creation_tokens,
                         input_cost_usd, output_cost_usd, cache_read_cost_usd,
                         cache_creation_cost_usd, total_cost_usd, is_streaming, latency_ms,
                         first_token_ms, duration_ms, status_code, error_message, created_at,
                         data_source, pricing_model, input_token_semantics
              FROM proxy_request_logs
              WHERE CAST(total_cost_usd AS REAL) <= 0
-               AND (input_tokens > 0 OR output_tokens > 0
+               AND (input_tokens > 0 OR output_tokens > 0 OR reasoning_output_tokens > 0
                     OR cache_read_tokens > 0 OR cache_creation_tokens > 0)";
 
         let mut logs = {
@@ -1880,6 +1940,7 @@ impl Database {
         let has_cost = existing_cost > rust_decimal::Decimal::ZERO;
         let has_usage = log.input_tokens > 0
             || log.output_tokens > 0
+            || log.reasoning_output_tokens > 0
             || log.cache_read_tokens > 0
             || log.cache_creation_tokens > 0;
 
@@ -2425,6 +2486,7 @@ mod tests {
                 model TEXT NOT NULL,
                 input_tokens INTEGER NOT NULL,
                 output_tokens INTEGER NOT NULL,
+                reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
                 cache_read_tokens INTEGER NOT NULL,
                 cache_creation_tokens INTEGER NOT NULL,
                 status_code INTEGER NOT NULL,
@@ -2473,11 +2535,23 @@ mod tests {
             model: "gpt-5.5",
             input_tokens: 10,
             output_tokens: 2,
+            reasoning_output_tokens: 516,
             cache_read_tokens: 1,
             cache_creation_tokens: 0,
+            cache_creation_tokens_known: false,
             created_at: 1000,
         };
         assert!(has_matching_proxy_usage_log(&conn, &key)?);
+        crate::usage_events::take_test_notify_count();
+        assert!(merge_reasoning_into_matching_proxy_log(&conn, &key)?);
+        let reasoning: i64 = conn.query_row(
+            "SELECT reasoning_output_tokens FROM proxy_request_logs
+             WHERE request_id = 'legacy-proxy'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(reasoning, 516);
+        assert_eq!(crate::usage_events::take_test_notify_count(), 1);
 
         Ok(())
     }
@@ -2499,8 +2573,10 @@ mod tests {
             model: "claude-sonnet-4-5",
             input_tokens: 100,
             output_tokens: 20,
+            reasoning_output_tokens: 0,
             cache_read_tokens: 10,
             cache_creation_tokens: 5,
+            cache_creation_tokens_known: true,
             created_at: 1060,
         };
         assert!(has_matching_proxy_usage_log(&conn, &key)?);
@@ -2548,6 +2624,64 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()?;
         assert_eq!(request_ids, vec!["desktop-proxy"]);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_codex_sidebar_uses_exact_cache_write_for_proxy_dedup() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        create_legacy_nullable_logs_table(&conn)?;
+        conn.execute_batch(
+            "INSERT INTO proxy_request_logs (
+                request_id, app_type, model, input_tokens, output_tokens,
+                reasoning_output_tokens, cache_read_tokens, cache_creation_tokens,
+                status_code, created_at, data_source
+            ) VALUES
+                ('proxy', 'codex', 'gpt-5.6-sol', 100, 20, 10, 5, 7, 200, 1000, 'proxy'),
+                ('sidebar-exact-zero', 'codex', 'gpt-5.6-sol', 100, 20, 10, 5, 0,
+                 200, 1001, 'codex_sidebar'),
+                ('sidebar-match', 'codex', 'gpt-5.6-sol', 100, 20, 10, 5, 7,
+                 200, 1002, 'codex_sidebar');",
+        )?;
+
+        let filter = effective_usage_log_filter("l");
+        let sql = format!(
+            "SELECT request_id FROM proxy_request_logs l WHERE {filter} ORDER BY request_id"
+        );
+        let request_ids = conn
+            .prepare(&sql)?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(request_ids, vec!["proxy", "sidebar-exact-zero"]);
+        Ok(())
+    }
+
+    #[test]
+    fn request_log_detail_maps_and_serializes_reasoning_tokens() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model,
+                    input_tokens, output_tokens, reasoning_output_tokens,
+                    latency_ms, status_code, created_at
+                 ) VALUES ('reasoning-detail', '_codex_session', 'codex', 'gpt-5.6',
+                           100, 20, 1552, 0, 200, 1000)",
+                [],
+            )?;
+        }
+
+        let detail = db
+            .get_request_detail("reasoning-detail")?
+            .expect("inserted request log");
+        assert_eq!(detail.reasoning_output_tokens, 1552);
+        let json = serde_json::to_value(detail)
+            .map_err(|e| AppError::Database(format!("序列化请求日志失败: {e}")))?;
+        assert_eq!(
+            json.get("reasoningOutputTokens"),
+            Some(&serde_json::json!(1552))
+        );
         Ok(())
     }
 

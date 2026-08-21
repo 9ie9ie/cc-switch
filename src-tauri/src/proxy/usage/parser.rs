@@ -59,6 +59,7 @@ fn response_id(body: &Value, field: &str) -> Option<String> {
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    pub reasoning_output_tokens: u32,
     pub cache_read_tokens: u32,
     pub cache_creation_tokens: u32,
     /// 从响应中提取的实际模型名称（如果可用）
@@ -94,12 +95,34 @@ impl TokenUsage {
     pub fn has_billable_tokens(&self) -> bool {
         self.input_tokens > 0
             || self.output_tokens > 0
+            || self.reasoning_output_tokens > 0
             || self.cache_read_tokens > 0
             || self.cache_creation_tokens > 0
     }
 }
 
 impl TokenUsage {
+    fn reasoning_output_tokens_from_usage(usage: &Value) -> u32 {
+        usage
+            .get("reasoning_output_tokens")
+            .and_then(Value::as_u64)
+            .or_else(|| usage.get("reasoning_tokens").and_then(Value::as_u64))
+            .or_else(|| usage.get("reasoningTokens").and_then(Value::as_u64))
+            .or_else(|| {
+                usage
+                    .get("output_tokens_details")
+                    .and_then(|details| details.get("reasoning_tokens"))
+                    .and_then(Value::as_u64)
+            })
+            .or_else(|| {
+                usage
+                    .get("completion_tokens_details")
+                    .and_then(|details| details.get("reasoning_tokens"))
+                    .and_then(Value::as_u64)
+            })
+            .unwrap_or(0) as u32
+    }
+
     /// 从 Claude API 非流式响应解析
     pub fn from_claude_response(body: &Value) -> Option<Self> {
         let usage = body.get("usage")?;
@@ -113,6 +136,7 @@ impl TokenUsage {
         Some(Self {
             input_tokens: usage.get("input_tokens")?.as_u64()? as u32,
             output_tokens: usage.get("output_tokens")?.as_u64()? as u32,
+            reasoning_output_tokens: Self::reasoning_output_tokens_from_usage(usage),
             cache_read_tokens: usage
                 .get("cache_read_input_tokens")
                 .and_then(|v| v.as_u64())
@@ -167,6 +191,9 @@ impl TokenUsage {
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(0)
                                 as u32;
+                            usage.reasoning_output_tokens = usage
+                                .reasoning_output_tokens
+                                .max(Self::reasoning_output_tokens_from_usage(msg_usage));
                         }
                     }
                     "message_delta" => {
@@ -177,6 +204,9 @@ impl TokenUsage {
                             {
                                 usage.output_tokens = output as u32;
                             }
+                            usage.reasoning_output_tokens = usage
+                                .reasoning_output_tokens
+                                .max(Self::reasoning_output_tokens_from_usage(delta_usage));
 
                             let delta_input = delta_usage
                                 .get("input_tokens")
@@ -277,6 +307,7 @@ impl TokenUsage {
         Some(Self {
             input_tokens: input_tokens? as u32,
             output_tokens: output_tokens? as u32,
+            reasoning_output_tokens: Self::reasoning_output_tokens_from_usage(usage),
             cache_read_tokens: cached_tokens,
             cache_creation_tokens: cache_write_tokens,
             model,
@@ -350,6 +381,7 @@ impl TokenUsage {
         Some(Self {
             input_tokens: prompt_tokens as u32,
             output_tokens: completion_tokens as u32,
+            reasoning_output_tokens: Self::reasoning_output_tokens_from_usage(usage),
             cache_read_tokens: cached_tokens,
             cache_creation_tokens: cache_write_tokens,
             model,
@@ -397,6 +429,12 @@ impl TokenUsage {
         Some(Self {
             input_tokens: prompt_tokens,
             output_tokens,
+            // thoughtsTokenCount 是 output 的子集（output 已含思考），仅作展示，
+            // 不参与费用计算。
+            reasoning_output_tokens: usage
+                .get("thoughtsTokenCount")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
             cache_read_tokens: usage
                 .get("cachedContentTokenCount")
                 .and_then(|v| v.as_u64())
@@ -413,6 +451,7 @@ impl TokenUsage {
         let mut total_input = 0u32;
         let mut total_tokens = 0u32;
         let mut total_cache_read = 0u32;
+        let mut total_thoughts = 0u32;
         let mut model: Option<String> = None;
         let mut message_id: Option<String> = None;
 
@@ -435,6 +474,12 @@ impl TokenUsage {
                     .get("cachedContentTokenCount")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as u32;
+
+                // 思考 tokens（output 的子集，仅作展示）
+                total_thoughts = usage
+                    .get("thoughtsTokenCount")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
             }
 
             // 提取实际使用的模型名称（modelVersion 字段）
@@ -455,6 +500,7 @@ impl TokenUsage {
             Some(Self {
                 input_tokens: total_input,
                 output_tokens: total_output,
+                reasoning_output_tokens: total_thoughts,
                 cache_read_tokens: total_cache_read,
                 cache_creation_tokens: 0,
                 model,
@@ -582,6 +628,83 @@ mod tests {
             ..Default::default()
         };
         assert!(normal.has_billable_tokens());
+        let only_reasoning = TokenUsage {
+            reasoning_output_tokens: 516,
+            ..Default::default()
+        };
+        assert!(only_reasoning.has_billable_tokens());
+    }
+
+    #[test]
+    fn codex_response_parses_reasoning_output_tokens() {
+        let response = json!({
+            "model": "gpt-5.6",
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 800,
+                "output_tokens_details": {
+                    "reasoning_tokens": 516
+                }
+            }
+        });
+
+        let usage = TokenUsage::from_codex_response(&response).unwrap();
+        assert_eq!(usage.reasoning_output_tokens, 516);
+    }
+
+    #[test]
+    fn openai_response_parses_completion_reasoning_tokens() {
+        let response = json!({
+            "model": "gpt-5.6",
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 800,
+                "completion_tokens_details": {
+                    "reasoning_tokens": 1034
+                }
+            }
+        });
+
+        let usage = TokenUsage::from_openai_response(&response).unwrap();
+        assert_eq!(usage.reasoning_output_tokens, 1034);
+    }
+
+    #[test]
+    fn claude_compatible_response_keeps_explicit_reasoning_tokens() {
+        let response = json!({
+            "model": "claude-opus-4-8",
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 800,
+                "reasoning_tokens": 419
+            }
+        });
+
+        let usage = TokenUsage::from_claude_response(&response).unwrap();
+        assert_eq!(usage.reasoning_output_tokens, 419);
+        assert_eq!(usage.output_tokens, 800);
+    }
+
+    #[test]
+    fn claude_compatible_stream_keeps_explicit_reasoning_tokens() {
+        let events = vec![
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_reasoning",
+                    "model": "claude-opus-4-8",
+                    "usage": {"input_tokens": 1000, "reasoningTokens": 200}
+                }
+            }),
+            json!({
+                "type": "message_delta",
+                "usage": {"output_tokens": 800, "reasoning_tokens": 419}
+            }),
+        ];
+
+        let usage = TokenUsage::from_claude_stream_events(&events).unwrap();
+        assert_eq!(usage.reasoning_output_tokens, 419);
+        assert_eq!(usage.output_tokens, 800);
     }
 
     #[test]
@@ -787,6 +910,51 @@ mod tests {
         assert_eq!(usage.cache_read_tokens, 0);
         assert_eq!(usage.cache_creation_tokens, 0);
         assert_eq!(usage.model, Some("gemini-3-pro-high".to_string()));
+    }
+
+    #[test]
+    fn gemini_response_parses_thoughts_token_count_as_reasoning() {
+        // thoughtsTokenCount 是真实 usage 字段：单独记录为 reasoning_output_tokens，
+        // output 仍为 total-prompt（已包含思考），费用不变。
+        let response = json!({
+            "modelVersion": "gemini-3-pro-high",
+            "usageMetadata": {
+                "promptTokenCount": 100,
+                "candidatesTokenCount": 30,
+                "thoughtsTokenCount": 70,
+                "totalTokenCount": 200,
+                "cachedContentTokenCount": 10
+            }
+        });
+
+        let usage = TokenUsage::from_gemini_response(&response).unwrap();
+        assert_eq!(usage.reasoning_output_tokens, 70);
+        assert_eq!(usage.output_tokens, 100);
+    }
+
+    #[test]
+    fn gemini_stream_chunks_parse_thoughts_token_count_as_reasoning() {
+        let chunks = vec![
+            json!({
+                "candidates": [{"content": {"parts": [{"text": "Hi"}], "role": "model"}}],
+                "modelVersion": "gemini-3.6-flash"
+            }),
+            json!({
+                "usageMetadata": {
+                    "promptTokenCount": 50,
+                    "candidatesTokenCount": 12,
+                    "thoughtsTokenCount": 38,
+                    "totalTokenCount": 100,
+                    "cachedContentTokenCount": 5
+                }
+            }),
+        ];
+
+        let usage = TokenUsage::from_gemini_stream_chunks(&chunks).unwrap();
+        assert_eq!(usage.input_tokens, 50);
+        assert_eq!(usage.output_tokens, 50);
+        assert_eq!(usage.reasoning_output_tokens, 38);
+        assert_eq!(usage.cache_read_tokens, 5);
     }
 
     #[test]

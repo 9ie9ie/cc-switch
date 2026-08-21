@@ -19,7 +19,10 @@ use crate::proxy::usage::parser::TokenUsage;
 use crate::services::session_usage::{
     metadata_modified_nanos, update_sync_state, SessionSyncResult,
 };
-use crate::services::usage_stats::{find_model_pricing, should_skip_session_insert, DedupKey};
+use crate::services::usage_stats::{
+    find_model_pricing, merge_reasoning_into_matching_proxy_log, should_skip_session_insert,
+    DedupKey,
+};
 use rust_decimal::Decimal;
 use std::fs;
 use std::time::SystemTime;
@@ -342,11 +345,15 @@ fn insert_opencode_message(
         model: &msg.model_id,
         input_tokens: msg.input_tokens,
         output_tokens: output_with_reasoning,
+        reasoning_output_tokens: msg.reasoning_tokens,
         cache_read_tokens: msg.cache_read_tokens,
         cache_creation_tokens: msg.cache_write_tokens,
+        cache_creation_tokens_known: true,
         created_at,
     };
-    if should_skip_session_insert(&conn, request_id, &dedup_key)? {
+    if merge_reasoning_into_matching_proxy_log(&conn, &dedup_key)?
+        || should_skip_session_insert(&conn, request_id, &dedup_key)?
+    {
         return Ok(false);
     }
 
@@ -367,6 +374,8 @@ fn insert_opencode_message(
             let usage = TokenUsage {
                 input_tokens: msg.input_tokens,
                 output_tokens: output_with_reasoning,
+                // reasoning 已含在 output 内，仅作展示，不影响费用。
+                reasoning_output_tokens: msg.reasoning_tokens,
                 cache_read_tokens: msg.cache_read_tokens,
                 cache_creation_tokens: msg.cache_write_tokens,
                 model: Some(msg.model_id.clone()),
@@ -402,11 +411,12 @@ fn insert_opencode_message(
     let inserted_rows = conn.execute(
         "INSERT OR IGNORE INTO proxy_request_logs (
             request_id, provider_id, app_type, model, request_model,
-            input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+            input_tokens, output_tokens, reasoning_output_tokens,
+            cache_read_tokens, cache_creation_tokens,
             input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
             latency_ms, first_token_ms, status_code, error_message, session_id,
             provider_type, is_streaming, cost_multiplier, created_at, data_source
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
         rusqlite::params![
             request_id,
             "_opencode_session",   // provider_id
@@ -415,6 +425,7 @@ fn insert_opencode_message(
             msg.model_id,          // request_model = model
             msg.input_tokens,
             output_with_reasoning,
+            msg.reasoning_tokens,
             msg.cache_read_tokens,
             msg.cache_write_tokens,
             input_cost,
@@ -442,6 +453,95 @@ fn insert_opencode_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_insert_opencode_message_stores_reasoning_tokens() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let msg = OpenCodeMessageData {
+            input_tokens: 1000,
+            output_tokens: 383,
+            reasoning_tokens: 419,
+            cache_read_tokens: 52_480,
+            cache_write_tokens: 0,
+            cost: 0.0,
+            model_id: "deepseek-v4-pro".to_string(),
+            timestamp_ms: 1_779_755_333_700,
+        };
+
+        assert!(insert_opencode_message(
+            &db,
+            "opencode-session-reasoning",
+            &msg,
+            "session-opencode",
+        )?);
+
+        let conn = lock_conn!(db.conn);
+        let (reasoning, output): (i64, i64) = conn.query_row(
+            "SELECT reasoning_output_tokens, output_tokens FROM proxy_request_logs
+             WHERE request_id = 'opencode-session-reasoning'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        // reasoning 单独记录；output 仍为 output + reasoning（费用口径不变）
+        assert_eq!(reasoning, 419);
+        assert_eq!(output, 383 + 419);
+        Ok(())
+    }
+
+    #[test]
+    fn test_opencode_session_enriches_matching_proxy_reasoning() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let msg = OpenCodeMessageData {
+            input_tokens: 1000,
+            output_tokens: 383,
+            reasoning_tokens: 419,
+            cache_read_tokens: 52_480,
+            cache_write_tokens: 0,
+            cost: 0.0,
+            model_id: "deepseek-v4-pro".to_string(),
+            timestamp_ms: 1_779_755_333_700,
+        };
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model, request_model,
+                    input_tokens, output_tokens, reasoning_output_tokens,
+                    cache_read_tokens, cache_creation_tokens, total_cost_usd,
+                    latency_ms, status_code, created_at, data_source
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, '0', 0, 200, ?10, 'proxy')",
+                rusqlite::params![
+                    "opencode-proxy",
+                    "provider",
+                    "opencode",
+                    msg.model_id,
+                    msg.model_id,
+                    msg.input_tokens,
+                    msg.output_tokens + msg.reasoning_tokens,
+                    msg.cache_read_tokens,
+                    msg.cache_write_tokens,
+                    msg.timestamp_ms / 1000,
+                ],
+            )?;
+        }
+
+        assert!(!insert_opencode_message(
+            &db,
+            "opencode-session-duplicate",
+            &msg,
+            "session-opencode",
+        )?);
+
+        let conn = lock_conn!(db.conn);
+        let (count, reasoning): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), MAX(reasoning_output_tokens) FROM proxy_request_logs",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(count, 1);
+        assert_eq!(reasoning, 419);
+        Ok(())
+    }
 
     #[test]
     fn test_parse_message_data_full() {
