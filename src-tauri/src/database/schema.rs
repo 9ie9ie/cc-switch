@@ -321,6 +321,8 @@ impl Database {
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
         Self::ensure_codex_timing_sync_column(conn)?;
+        Self::ensure_codex_sidebar_event_map_table(conn)?;
+        Self::normalize_codex_turn_timing_latency(conn)?;
 
         // Session detail rows are pruned after rollup, so request IDs needed
         // for fork/rewrite deduplication live in a compact durable ledger.
@@ -565,6 +567,8 @@ impl Database {
             }
             Self::ensure_reasoning_output_token_columns(conn)?;
             Self::ensure_codex_timing_sync_column(conn)?;
+            Self::ensure_codex_sidebar_event_map_table(conn)?;
+            Self::normalize_codex_turn_timing_latency(conn)?;
             Ok(())
         })();
 
@@ -3159,6 +3163,48 @@ impl Database {
         Ok(())
     }
 
+    fn ensure_codex_sidebar_event_map_table(conn: &Connection) -> Result<(), AppError> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS codex_sidebar_event_map (
+                event_id TEXT PRIMARY KEY,
+                target_request_id TEXT,
+                target_data_source TEXT,
+                thread_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                duration_ms INTEGER,
+                first_token_ms INTEGER
+            )",
+            [],
+        )
+        .map_err(|error| AppError::Database(format!("创建 Codex 侧边栏事件映射表失败: {error}")))?;
+        Ok(())
+    }
+
+    fn normalize_codex_turn_timing_latency(conn: &Connection) -> Result<(), AppError> {
+        if Self::table_exists(conn, "proxy_request_logs")? {
+            conn.execute(
+                "UPDATE proxy_request_logs
+                    SET latency_ms = 0
+                  WHERE data_source IN ('codex_session', 'codex_sidebar')
+                    AND latency_ms != 0",
+                [],
+            )
+            .map_err(|error| AppError::Database(format!("修正 Codex 整轮用时字段失败: {error}")))?;
+        }
+        if Self::table_exists(conn, "usage_daily_rollups")? {
+            conn.execute(
+                "UPDATE usage_daily_rollups
+                    SET avg_latency_ms = 0
+                  WHERE app_type = 'codex'
+                    AND provider_id IN ('_codex_session', '_codex_sidebar')
+                    AND avg_latency_ms != 0",
+                [],
+            )
+            .map_err(|error| AppError::Database(format!("修正 Codex 汇总延迟字段失败: {error}")))?;
+        }
+        Ok(())
+    }
+
     // --- 辅助方法 ---
 
     pub(crate) fn get_user_version(conn: &Connection) -> Result<i32, AppError> {
@@ -3558,6 +3604,8 @@ mod tests {
         Database::ensure_reasoning_output_token_columns(&conn)?;
         Database::ensure_codex_timing_sync_column(&conn)?;
         Database::ensure_codex_timing_sync_column(&conn)?;
+        Database::ensure_codex_sidebar_event_map_table(&conn)?;
+        Database::ensure_codex_sidebar_event_map_table(&conn)?;
 
         assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
         assert!(Database::has_column(
@@ -3575,6 +3623,7 @@ mod tests {
             "session_log_sync",
             "codex_timing_line_offset"
         )?);
+        assert!(Database::table_exists(&conn, "codex_sidebar_event_map")?);
         Ok(())
     }
 }

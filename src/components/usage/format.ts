@@ -31,6 +31,21 @@ export function fmtUsd(
   return `$${num.toFixed(digits)}`;
 }
 
+export function formatTimingMs(milliseconds: number): string {
+  const seconds = Math.max(milliseconds, 0) / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+
+  const wholeMinutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds - wholeMinutes * 60;
+  if (wholeMinutes < 60) {
+    return `${wholeMinutes}m ${remainingSeconds.toFixed(1)}s`;
+  }
+
+  const hours = Math.floor(wholeMinutes / 60);
+  const remainingMinutes = wholeMinutes % 60;
+  return `${hours}h ${remainingMinutes}m ${remainingSeconds.toFixed(1)}s`;
+}
+
 function normalizeLanguageTag(language: string): string {
   return language.toLowerCase().replace(/_/g, "-");
 }

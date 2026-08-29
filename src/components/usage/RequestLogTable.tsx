@@ -29,6 +29,7 @@ import { UsageDateRangePicker } from "./UsageDateRangePicker";
 import {
   fmtInt,
   fmtUsd,
+  formatTimingMs,
   getLocaleFromLanguage,
   parseFiniteNumber,
 } from "./format";
@@ -46,6 +47,8 @@ interface RequestLogTableProps {
 export function isReasoningTokenWarning(tokens: number): boolean {
   return Number.isInteger(tokens) && tokens > 0 && (tokens + 2) % 518 === 0;
 }
+
+const CODEX_TURN_TIMING_SOURCES = new Set(["codex_session", "codex_sidebar"]);
 
 export function RequestLogTable({
   range,
@@ -316,11 +319,47 @@ export function RequestLogTable({
                             )}
                         </TableCell>
                         <TableCell className="text-center whitespace-nowrap text-xs tabular-nums">
-                          {(log.latencyMs / 1000).toFixed(1)}s
-                          {log.firstTokenMs != null && (
-                            <span className="text-muted-foreground">
-                              /{(log.firstTokenMs / 1000).toFixed(1)}s
-                            </span>
+                          {CODEX_TURN_TIMING_SOURCES.has(
+                            log.dataSource ?? "",
+                          ) ? (
+                            log.durationMs != null ? (
+                              <div
+                                title={t(
+                                  "usage.codexTurnTimingHint",
+                                  "整轮耗时包含模型调用、命令执行和等待，不是单次模型请求耗时",
+                                )}
+                              >
+                                <div>
+                                  {t("usage.wholeTurn", "整轮")}{" "}
+                                  {formatTimingMs(log.durationMs)}
+                                </div>
+                                {log.firstTokenMs != null && (
+                                  <div className="text-muted-foreground">
+                                    {t("usage.firstToken", "首字")}{" "}
+                                    {formatTimingMs(log.firstTokenMs)}
+                                  </div>
+                                )}
+                              </div>
+                            ) : (
+                              <span
+                                className="text-muted-foreground"
+                                title={t(
+                                  "usage.requestTimingUnavailable",
+                                  "Codex 本地日志没有记录该次模型请求的用时",
+                                )}
+                              >
+                                —
+                              </span>
+                            )
+                          ) : (
+                            <>
+                              {formatTimingMs(log.latencyMs)}
+                              {log.firstTokenMs != null && (
+                                <span className="text-muted-foreground">
+                                  /{formatTimingMs(log.firstTokenMs)}
+                                </span>
+                              )}
+                            </>
                           )}
                         </TableCell>
                         <TableCell className="text-center">

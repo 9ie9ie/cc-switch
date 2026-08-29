@@ -1602,13 +1602,13 @@ fn apply_codex_timing_updates_on_conn(
     let mut statement = conn
         .prepare_cached(
             "UPDATE proxy_request_logs
-                SET latency_ms = ?2,
+                SET latency_ms = 0,
                     first_token_ms = ?3,
                     duration_ms = ?2
               WHERE request_id = ?1
                 AND data_source = 'codex_session'
                 AND (
-                    latency_ms != ?2
+                    latency_ms != 0
                     OR first_token_ms IS NOT ?3
                     OR duration_ms IS NOT ?2
                 )",
@@ -1774,7 +1774,7 @@ fn insert_codex_session_entry_on_conn(
                 cache_read_cost,
                 cache_creation_cost,
                 total_cost,
-                duration_ms.unwrap_or(0), // latency_ms
+                0i64,                    // local rollout has no per-request latency
                 first_token_ms,
                 duration_ms,
                 200i64,              // status_code
@@ -2625,10 +2625,7 @@ mod tests {
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        assert_eq!(
-            rows,
-            vec![(0, None, None), (4_200, Some(1_300), Some(4_200))]
-        );
+        assert_eq!(rows, vec![(0, None, None), (0, Some(1_300), Some(4_200))]);
         Ok(())
     }
 
@@ -2674,7 +2671,7 @@ mod tests {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        assert_eq!(timing, (5_500, Some(900), Some(5_500)));
+        assert_eq!(timing, (0, Some(900), Some(5_500)));
         Ok(())
     }
 
@@ -2725,7 +2722,7 @@ mod tests {
             [file.to_string_lossy().as_ref()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
-        assert_eq!(timing, (6_000, Some(1_200), Some(6_000), 5));
+        assert_eq!(timing, (0, Some(1_200), Some(6_000), 5));
         Ok(())
     }
 

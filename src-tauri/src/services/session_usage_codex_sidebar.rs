@@ -12,8 +12,8 @@ use crate::services::session_usage::{
 };
 use crate::services::sql_helpers::INPUT_TOKEN_SEMANTICS_TOTAL;
 use crate::services::usage_stats::{
-    find_model_pricing, merge_reasoning_into_matching_proxy_log, should_skip_session_insert,
-    DedupKey, SESSION_PROXY_DEDUP_WINDOW_SECONDS,
+    find_model_pricing, merge_reasoning_into_matching_proxy_log_with_id,
+    should_skip_session_insert, DedupKey, SESSION_PROXY_DEDUP_WINDOW_SECONDS,
 };
 use rusqlite::OptionalExtension;
 use rust_decimal::Decimal;
@@ -324,31 +324,135 @@ fn apply_sidebar_timing_on_conn(
     let first_token_ms = event
         .first_token_ms
         .map(|value| value.min(i64::MAX as u64) as i64);
+    let stored = conn
+        .prepare_cached(
+            "INSERT INTO codex_sidebar_event_map (
+                event_id, target_request_id, target_data_source, thread_id, turn_id,
+                duration_ms, first_token_ms
+             ) VALUES (?1, NULL, NULL, ?2, ?3, ?4, ?5)
+             ON CONFLICT(event_id) DO UPDATE SET
+                thread_id = excluded.thread_id,
+                turn_id = excluded.turn_id,
+                duration_ms = excluded.duration_ms,
+                first_token_ms = excluded.first_token_ms
+             WHERE codex_sidebar_event_map.thread_id != excluded.thread_id
+                OR codex_sidebar_event_map.turn_id != excluded.turn_id
+                OR codex_sidebar_event_map.duration_ms IS NOT excluded.duration_ms
+                OR codex_sidebar_event_map.first_token_ms IS NOT excluded.first_token_ms",
+        )
+        .and_then(|mut statement| {
+            statement.execute(rusqlite::params![
+                event.target_event_id,
+                event.thread_id,
+                event.turn_id,
+                duration_ms,
+                first_token_ms
+            ])
+        })
+        .map_err(|error| {
+            AppError::Database(format!("store Codex sidebar timing failed: {error}"))
+        })?;
+    let applied = apply_stored_sidebar_timing_on_conn(conn, &event.target_event_id)?;
+    Ok(stored > 0 || applied)
+}
+
+fn record_sidebar_usage_target_on_conn(
+    conn: &rusqlite::Connection,
+    event: &SidebarUsageEvent,
+    target_request_id: &str,
+    target_data_source: &str,
+) -> Result<(), AppError> {
+    conn.prepare_cached(
+        "INSERT INTO codex_sidebar_event_map (
+            event_id, target_request_id, target_data_source, thread_id, turn_id,
+            duration_ms, first_token_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL)
+         ON CONFLICT(event_id) DO UPDATE SET
+            target_request_id = excluded.target_request_id,
+            target_data_source = excluded.target_data_source,
+            thread_id = excluded.thread_id,
+            turn_id = excluded.turn_id",
+    )
+    .and_then(|mut statement| {
+        statement.execute(rusqlite::params![
+            event.event_id,
+            target_request_id,
+            target_data_source,
+            event.thread_id,
+            event.turn_id
+        ])
+    })
+    .map_err(|error| {
+        AppError::Database(format!("store Codex sidebar usage target failed: {error}"))
+    })?;
+    apply_stored_sidebar_timing_on_conn(conn, &event.event_id)?;
+    Ok(())
+}
+
+fn apply_stored_sidebar_timing_on_conn(
+    conn: &rusqlite::Connection,
+    event_id: &str,
+) -> Result<bool, AppError> {
+    let mapping = conn
+        .prepare_cached(
+            "SELECT target_request_id, target_data_source, duration_ms, first_token_ms
+               FROM codex_sidebar_event_map
+              WHERE event_id = ?1",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_row([event_id], |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                })
+                .optional()
+        })
+        .map_err(|error| {
+            AppError::Database(format!("load Codex sidebar timing target failed: {error}"))
+        })?;
+    let Some((
+        Some(target_request_id),
+        Some(target_data_source),
+        Some(duration_ms),
+        first_token_ms,
+    )) = mapping
+    else {
+        return Ok(false);
+    };
+
+    // A proxy row already has request-scoped timing. Do not replace it with
+    // turn-scoped sidebar timing.
+    if target_data_source == "proxy" {
+        return Ok(false);
+    }
+
     let updated = conn
         .prepare_cached(
             "UPDATE proxy_request_logs
-                SET latency_ms = ?2,
+                SET latency_ms = 0,
                     first_token_ms = ?3,
                     duration_ms = ?2
               WHERE request_id = ?1
-                AND data_source = 'codex_sidebar'
-                AND session_id = ?4
+                AND data_source IN ('codex_session', 'codex_sidebar')
                 AND (
-                    latency_ms != ?2
+                    latency_ms != 0
                     OR first_token_ms IS NOT ?3
                     OR duration_ms IS NOT ?2
                 )",
         )
         .and_then(|mut statement| {
             statement.execute(rusqlite::params![
-                event.target_event_id,
+                target_request_id,
                 duration_ms,
-                first_token_ms,
-                event.thread_id
+                first_token_ms
             ])
         })
         .map_err(|error| {
-            AppError::Database(format!("update Codex sidebar timing failed: {error}"))
+            AppError::Database(format!("apply Codex sidebar timing failed: {error}"))
         })?;
     Ok(updated > 0)
 }
@@ -390,13 +494,20 @@ fn insert_sidebar_usage_on_conn(
         created_at,
     };
 
-    if merge_reasoning_into_matching_proxy_log(conn, &dedup_key)? {
+    if let Some(request_id) = merge_reasoning_into_matching_proxy_log_with_id(conn, &dedup_key)? {
+        record_sidebar_usage_target_on_conn(conn, event, &request_id, "proxy")?;
         return Ok(false);
     }
-    if merge_reasoning_into_matching_codex_session(conn, event, &usage, model, created_at)? {
+    if let Some(request_id) =
+        merge_reasoning_into_matching_codex_session(conn, event, &usage, model, created_at)?
+    {
+        record_sidebar_usage_target_on_conn(conn, event, &request_id, "codex_session")?;
         return Ok(false);
     }
     if should_skip_session_insert(conn, &event.event_id, &dedup_key)? {
+        if let Some(data_source) = request_data_source_on_conn(conn, &event.event_id)? {
+            record_sidebar_usage_target_on_conn(conn, event, &event.event_id, &data_source)?;
+        }
         return Ok(false);
     }
 
@@ -474,7 +585,31 @@ fn insert_sidebar_usage_on_conn(
         .map_err(|error| {
             AppError::Database(format!("insert Codex sidebar usage failed: {error}"))
         })?;
+    if inserted > 0 {
+        record_sidebar_usage_target_on_conn(conn, event, &event.event_id, "codex_sidebar")?;
+    }
     Ok(inserted > 0)
+}
+
+fn request_data_source_on_conn(
+    conn: &rusqlite::Connection,
+    request_id: &str,
+) -> Result<Option<String>, AppError> {
+    conn.prepare_cached(
+        "SELECT COALESCE(data_source, 'proxy')
+           FROM proxy_request_logs
+          WHERE request_id = ?1",
+    )
+    .and_then(|mut statement| {
+        statement
+            .query_row([request_id], |row| row.get(0))
+            .optional()
+    })
+    .map_err(|error| {
+        AppError::Database(format!(
+            "load Codex sidebar request data source failed: {error}"
+        ))
+    })
 }
 
 /// Prefer the rollout-derived row when a nominally ephemeral thread is also
@@ -487,7 +622,7 @@ fn merge_reasoning_into_matching_codex_session(
     usage: &TokenUsage,
     model: &str,
     created_at: i64,
-) -> Result<bool, AppError> {
+) -> Result<Option<String>, AppError> {
     let matching = conn
         .prepare_cached(
             "SELECT request_id, reasoning_output_tokens
@@ -539,7 +674,7 @@ fn merge_reasoning_into_matching_codex_session(
         })?;
 
     let Some((request_id, existing_reasoning)) = matching else {
-        return Ok(false);
+        return Ok(None);
     };
     if usage.reasoning_output_tokens > existing_reasoning {
         conn.execute(
@@ -554,7 +689,7 @@ fn merge_reasoning_into_matching_codex_session(
             ))
         })?;
     }
-    Ok(true)
+    Ok(Some(request_id))
 }
 
 #[cfg(test)]
@@ -702,9 +837,94 @@ mod tests {
             rows,
             vec![
                 (first_id.to_string(), 0, None, None),
-                (final_id.to_string(), 4_200, Some(700), Some(4_200)),
+                (final_id.to_string(), 0, Some(700), Some(4_200)),
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn timing_follows_usage_merged_into_codex_session_row() -> Result<(), AppError> {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sidebar.jsonl");
+        let event_id = "codex_sidebar:usage-v1:thread-side:turn-side:1";
+        let session_request_id = "codex_session:thread-v1:thread-side:1";
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model,
+                    input_tokens, output_tokens, reasoning_output_tokens,
+                    cache_read_tokens, cache_creation_tokens,
+                    latency_ms, status_code, session_id, created_at, data_source
+                 ) VALUES (?1, '_codex_session', 'codex', 'gpt-5.6-sol',
+                    1200, 90, 0, 100, 0, 0, 200, 'thread-side', 1800000000,
+                    'codex_session')",
+                [session_request_id],
+            )?;
+        }
+
+        append_value(&path, &event(event_id, 1200, 90, 50));
+        assert_eq!(sync_codex_sidebar_usage_file(&db, &path)?.imported, 0);
+        append_value(&path, &timing_event(event_id, 4_200, 700));
+        assert_eq!(sync_codex_sidebar_usage_file(&db, &path)?.imported, 1);
+
+        let conn = lock_conn!(db.conn);
+        let row: (i64, i64, Option<i64>, Option<i64>) = conn.query_row(
+            "SELECT reasoning_output_tokens, latency_ms, first_token_ms, duration_ms
+               FROM proxy_request_logs
+              WHERE request_id = ?1",
+            [session_request_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(row, (50, 0, Some(700), Some(4_200)));
+        let sidebar_rows: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source = 'codex_sidebar'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(sidebar_rows, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn sidebar_turn_timing_does_not_replace_proxy_request_timing() -> Result<(), AppError> {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sidebar.jsonl");
+        let event_id = "codex_sidebar:usage-v1:thread-side:turn-side:1";
+        let proxy_request_id = "proxy-request-1";
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model,
+                    input_tokens, output_tokens, reasoning_output_tokens,
+                    cache_read_tokens, cache_creation_tokens,
+                    latency_ms, first_token_ms, duration_ms, status_code,
+                    session_id, created_at, data_source
+                 ) VALUES (?1, 'provider', 'codex', 'gpt-5.6-sol',
+                    1200, 90, 0, 100, 5, 1250, 300, 1250, 200,
+                    'thread-side', 1800000000, 'proxy')",
+                [proxy_request_id],
+            )?;
+        }
+
+        append_value(&path, &event(event_id, 1200, 90, 50));
+        assert_eq!(sync_codex_sidebar_usage_file(&db, &path)?.imported, 0);
+        append_value(&path, &timing_event(event_id, 4_200, 700));
+        assert_eq!(sync_codex_sidebar_usage_file(&db, &path)?.imported, 1);
+
+        let conn = lock_conn!(db.conn);
+        let row: (i64, i64, Option<i64>, Option<i64>) = conn.query_row(
+            "SELECT reasoning_output_tokens, latency_ms, first_token_ms, duration_ms
+               FROM proxy_request_logs
+              WHERE request_id = ?1",
+            [proxy_request_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(row, (50, 1_250, Some(300), Some(1_250)));
         Ok(())
     }
 

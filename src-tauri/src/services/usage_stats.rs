@@ -466,8 +466,15 @@ pub(crate) fn merge_reasoning_into_matching_proxy_log(
     conn: &Connection,
     key: &DedupKey,
 ) -> Result<bool, AppError> {
+    Ok(merge_reasoning_into_matching_proxy_log_with_id(conn, key)?.is_some())
+}
+
+pub(crate) fn merge_reasoning_into_matching_proxy_log_with_id(
+    conn: &Connection,
+    key: &DedupKey,
+) -> Result<Option<String>, AppError> {
     let Some((request_id, existing_reasoning)) = matching_proxy_usage_log(conn, key)? else {
-        return Ok(false);
+        return Ok(None);
     };
 
     if key.reasoning_output_tokens > existing_reasoning {
@@ -483,7 +490,7 @@ pub(crate) fn merge_reasoning_into_matching_proxy_log(
             crate::usage_events::notify_log_recorded();
         }
     }
-    Ok(true)
+    Ok(Some(request_id))
 }
 
 /// grokbuild 会话导入的接管活动守卫：给定时刻 ±窗口内存在任何 grokbuild

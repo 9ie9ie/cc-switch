@@ -4,6 +4,7 @@ import {
   isReasoningTokenWarning,
   RequestLogTable,
 } from "@/components/usage/RequestLogTable";
+import { formatTimingMs } from "@/components/usage/format";
 import type { RequestLog, UsageRangeSelection } from "@/types/usage";
 
 const useRequestLogsMock = vi.hoisted(() => vi.fn());
@@ -111,6 +112,70 @@ describe("RequestLogTable", () => {
       expect(isReasoningTokenWarning(tokens)).toBe(false);
     },
   );
+
+  it.each([
+    [8_178, "8.2s"],
+    [65_250, "1m 5.3s"],
+    [5_208_631, "1h 26m 48.6s"],
+  ])("formats %i ms as %s", (milliseconds, expected) => {
+    expect(formatTimingMs(milliseconds as number)).toBe(expected);
+  });
+
+  it("shows Codex turn timing with its correct scope", () => {
+    useRequestLogsMock.mockReturnValue({
+      data: {
+        data: [
+          makeRequestLog({
+            latencyMs: 0,
+            durationMs: 5_208_631,
+            firstTokenMs: 8_178,
+          }),
+        ],
+        total: 1,
+        page: 0,
+        pageSize: 20,
+      },
+      isLoading: false,
+    });
+
+    render(
+      <RequestLogTable
+        range={{ preset: "today" }}
+        rangeLabel="Today"
+        appType="codex"
+        refreshIntervalMs={0}
+      />,
+    );
+
+    expect(
+      screen.getByText("usage.wholeTurn 1h 26m 48.6s"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("usage.firstToken 8.2s")).toBeInTheDocument();
+  });
+
+  it("shows unavailable instead of zero for Codex request timing", () => {
+    useRequestLogsMock.mockReturnValue({
+      data: {
+        data: [makeRequestLog({ latencyMs: 0, durationMs: undefined })],
+        total: 1,
+        page: 0,
+        pageSize: 20,
+      },
+      isLoading: false,
+    });
+
+    render(
+      <RequestLogTable
+        range={{ preset: "today" }}
+        rangeLabel="Today"
+        appType="codex"
+        refreshIntervalMs={0}
+      />,
+    );
+
+    expect(screen.getByText("—")).toBeInTheDocument();
+    expect(screen.queryByText("0.0s")).not.toBeInTheDocument();
+  });
 
   it("resets pagination when the dashboard range changes", async () => {
     const initialRange: UsageRangeSelection = { preset: "today" };
@@ -333,7 +398,9 @@ describe("RequestLogTable", () => {
         <RequestLogTable
           range={{ preset: "today" }}
           rangeLabel="Today"
-          appType={appType as "claude" | "codex" | "gemini" | "grokbuild" | "opencode"}
+          appType={
+            appType as "claude" | "codex" | "gemini" | "grokbuild" | "opencode"
+          }
           refreshIntervalMs={0}
         />,
       );
