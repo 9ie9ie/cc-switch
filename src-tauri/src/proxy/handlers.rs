@@ -1143,6 +1143,7 @@ async fn handle_responses_compact_for_app(
             &ctx,
             &state,
             connection_guard,
+            is_stream,
             namespace_restore_map,
         )
         .await;

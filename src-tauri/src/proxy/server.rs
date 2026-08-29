@@ -416,6 +416,7 @@ impl ProxyServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::AppError;
     use crate::provider::{Provider, ProviderMeta};
     use axum::http::{header, HeaderMap, StatusCode};
     use rusqlite::OptionalExtension;
