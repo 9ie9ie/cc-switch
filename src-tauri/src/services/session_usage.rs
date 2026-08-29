@@ -712,10 +712,16 @@ fn update_claude_sync_state_on_conn(
         .unwrap_or(0);
 
     conn.prepare_cached(
-        "INSERT OR REPLACE INTO session_log_sync
+        "INSERT INTO session_log_sync
              (file_path, last_modified, last_line_offset, last_synced_at, last_byte_offset,
               last_tail_fingerprint)
-         VALUES (?1, ?2, 0, ?3, ?4, ?5)",
+         VALUES (?1, ?2, 0, ?3, ?4, ?5)
+         ON CONFLICT(file_path) DO UPDATE SET
+             last_modified = excluded.last_modified,
+             last_line_offset = 0,
+             last_synced_at = excluded.last_synced_at,
+             last_byte_offset = excluded.last_byte_offset,
+             last_tail_fingerprint = excluded.last_tail_fingerprint",
     )
     .and_then(|mut stmt| {
         stmt.execute(rusqlite::params![
@@ -785,10 +791,22 @@ pub(crate) fn update_sync_state_on_conn(
         .unwrap_or(0);
 
     conn.prepare_cached(
-        "INSERT OR REPLACE INTO session_log_sync (file_path, last_modified, last_line_offset, last_synced_at)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO session_log_sync
+             (file_path, last_modified, last_line_offset, last_synced_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(file_path) DO UPDATE SET
+             last_modified = excluded.last_modified,
+             last_line_offset = excluded.last_line_offset,
+             last_synced_at = excluded.last_synced_at",
     )
-    .and_then(|mut stmt| stmt.execute(rusqlite::params![file_path, last_modified, last_offset, now]))
+    .and_then(|mut stmt| {
+        stmt.execute(rusqlite::params![
+            file_path,
+            last_modified,
+            last_offset,
+            now
+        ])
+    })
     .map_err(|e| AppError::Database(format!("更新同步状态失败: {e}")))?;
     Ok(())
 }
@@ -968,6 +986,41 @@ mod tests {
         assert!(session_sync_mutex().try_lock().is_err());
         drop(first);
         assert!(session_sync_mutex().try_lock().is_ok());
+    }
+
+    #[test]
+    fn generic_sync_update_preserves_specialized_cursor_columns() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO session_log_sync (
+                    file_path, last_modified, last_line_offset, last_synced_at,
+                    last_byte_offset, last_tail_fingerprint, codex_timing_line_offset
+                 ) VALUES ('cursor-test', 1, 2, 3, 4, 5, 6)",
+                [],
+            )?;
+            update_sync_state_on_conn(&conn, "cursor-test", 10, 20)?;
+        }
+
+        let conn = lock_conn!(db.conn);
+        let cursor: (i64, i64, Option<i64>, Option<i64>, i64) = conn.query_row(
+            "SELECT last_modified, last_line_offset, last_byte_offset,
+                    last_tail_fingerprint, codex_timing_line_offset
+               FROM session_log_sync WHERE file_path = 'cursor-test'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        assert_eq!(cursor, (10, 20, Some(4), Some(5), 6));
+        Ok(())
     }
 
     #[test]

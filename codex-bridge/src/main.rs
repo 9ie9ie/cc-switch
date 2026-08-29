@@ -12,12 +12,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const REAL_CLI_PATH_ENV: &str = "CC_SWITCH_CODEX_REAL_CLI_PATH";
 const USAGE_PATH_ENV: &str = "CC_SWITCH_CODEX_SIDEBAR_USAGE_PATH";
 const USAGE_FILE: &str = "codex-sidebar-usage.jsonl";
 const EVENT_ID_PREFIX: &str = "codex_sidebar:usage-v1:";
+const TIMING_EVENT_ID_PREFIX: &str = "codex_sidebar:timing-v1:";
 
 fn main() {
     match run() {
@@ -119,8 +120,8 @@ fn forward_server_output<R: Read, W: Write>(
             .ok()
             .and_then(|value| lock_state(&state).observe_server_message(&value));
         if let Some(record) = record {
-            if let Err(error) = append_usage_record(&record) {
-                eprintln!("cc-switch Codex bridge could not persist usage: {error}");
+            if let Err(error) = append_record(&record) {
+                eprintln!("cc-switch Codex bridge could not persist telemetry: {error}");
             }
         }
     }
@@ -154,6 +155,7 @@ enum PendingRequest {
     Turn {
         thread_id: String,
         model_override: Option<String>,
+        started_at: Instant,
     },
 }
 
@@ -169,6 +171,9 @@ struct TurnInfo {
     model: String,
     sequence: u64,
     last_total: Option<UsageSignature>,
+    started_at: Instant,
+    first_token_ms: Option<u64>,
+    timing_emitted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,6 +253,26 @@ struct UsageRecord {
     usage: UsageBreakdown,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct TimingRecord {
+    schema_version: u32,
+    event_id: String,
+    target_event_id: String,
+    thread_id: String,
+    turn_id: String,
+    completed_at_ms: i64,
+    duration_ms: u64,
+    first_token_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+enum BridgeRecord {
+    Usage(UsageRecord),
+    Timing(TimingRecord),
+}
+
 impl BridgeState {
     fn observe_client_message(&mut self, value: &Value) {
         let Some(method) = value.get("method").and_then(Value::as_str) else {
@@ -292,6 +317,7 @@ impl BridgeState {
                     PendingRequest::Turn {
                         thread_id: thread_id.to_owned(),
                         model_override,
+                        started_at: Instant::now(),
                     },
                 );
             }
@@ -299,7 +325,7 @@ impl BridgeState {
         }
     }
 
-    fn observe_server_message(&mut self, value: &Value) -> Option<UsageRecord> {
+    fn observe_server_message(&mut self, value: &Value) -> Option<BridgeRecord> {
         if let Some(id) = value.get("id").and_then(request_key) {
             self.observe_response(&id, value);
             return None;
@@ -311,8 +337,12 @@ impl BridgeState {
             "thread/settings/updated" => self.observe_thread_settings(value),
             "thread/closed" | "thread/deleted" => self.observe_thread_closed(value),
             "turn/started" => self.observe_turn_started(value),
+            "item/agentMessage/delta" => self.observe_agent_message_delta(value),
+            "turn/completed" => return self.capture_timing(value).map(BridgeRecord::Timing),
             "model/rerouted" => self.observe_model_rerouted(value),
-            "thread/tokenUsage/updated" => return self.capture_usage(value),
+            "thread/tokenUsage/updated" => {
+                return self.capture_usage(value).map(BridgeRecord::Usage)
+            }
             _ => {}
         }
         None
@@ -350,6 +380,7 @@ impl BridgeState {
             PendingRequest::Turn {
                 thread_id,
                 model_override,
+                started_at,
             } => {
                 let Some(turn_id) = result.pointer("/turn/id").and_then(Value::as_str) else {
                     return;
@@ -361,15 +392,21 @@ impl BridgeState {
                             .map(|thread| thread.model.clone())
                     })
                     .unwrap_or_else(|| "unknown".to_string());
-                self.turns.insert(
-                    turn_id.to_owned(),
-                    TurnInfo {
+                self.turns
+                    .entry(turn_id.to_owned())
+                    .and_modify(|turn| {
+                        turn.thread_id = thread_id.clone();
+                        turn.model = model.clone();
+                    })
+                    .or_insert(TurnInfo {
                         thread_id,
                         model,
                         sequence: 0,
                         last_total: None,
-                    },
-                );
+                        started_at,
+                        first_token_ms: None,
+                        timing_emitted: false,
+                    });
             }
         }
     }
@@ -421,23 +458,84 @@ impl BridgeState {
         let Some(turn_id) = value.pointer("/params/turn/id").and_then(Value::as_str) else {
             return;
         };
-        if self.turns.contains_key(turn_id) {
-            return;
-        }
         let model = self
             .threads
             .get(thread_id)
             .map(|thread| thread.model.clone())
             .unwrap_or_else(|| "unknown".to_string());
-        self.turns.insert(
-            turn_id.to_owned(),
-            TurnInfo {
+        self.turns
+            .entry(turn_id.to_owned())
+            .and_modify(|turn| {
+                if turn.sequence == 0 && turn.first_token_ms.is_none() {
+                    turn.started_at = Instant::now();
+                }
+                turn.thread_id = thread_id.to_owned();
+                turn.model = model.clone();
+            })
+            .or_insert(TurnInfo {
                 thread_id: thread_id.to_owned(),
                 model,
                 sequence: 0,
                 last_total: None,
-            },
-        );
+                started_at: Instant::now(),
+                first_token_ms: None,
+                timing_emitted: false,
+            });
+    }
+
+    fn observe_agent_message_delta(&mut self, value: &Value) {
+        let Some(turn_id) = value.pointer("/params/turnId").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(delta) = value.pointer("/params/delta").and_then(Value::as_str) else {
+            return;
+        };
+        if delta.is_empty() {
+            return;
+        }
+        if let Some(turn) = self.turns.get_mut(turn_id) {
+            if turn.first_token_ms.is_none() {
+                turn.first_token_ms =
+                    Some(turn.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64);
+            }
+        }
+    }
+
+    fn capture_timing(&mut self, value: &Value) -> Option<TimingRecord> {
+        let thread_id = value.pointer("/params/threadId").and_then(Value::as_str)?;
+        let turn_id = value.pointer("/params/turn/id").and_then(Value::as_str)?;
+        if !self
+            .threads
+            .get(thread_id)
+            .is_some_and(|thread| thread.ephemeral)
+        {
+            return None;
+        }
+        let turn = self.turns.get_mut(turn_id)?;
+        if turn.thread_id != thread_id || turn.sequence == 0 || turn.timing_emitted {
+            return None;
+        }
+        let duration_ms = value
+            .pointer("/params/turn/durationMs")
+            .and_then(nonnegative_u64)
+            .unwrap_or_else(|| turn.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64);
+        let completed_at_ms = value
+            .pointer("/params/turn/completedAt")
+            .and_then(nonnegative_u64)
+            .and_then(|value| value.checked_mul(1000))
+            .and_then(|value| i64::try_from(value).ok())
+            .unwrap_or_else(now_millis);
+        turn.timing_emitted = true;
+        Some(TimingRecord {
+            schema_version: 1,
+            event_id: format!("{TIMING_EVENT_ID_PREFIX}{thread_id}:{turn_id}"),
+            target_event_id: format!("{EVENT_ID_PREFIX}{thread_id}:{turn_id}:{}", turn.sequence),
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            completed_at_ms,
+            duration_ms,
+            first_token_ms: turn.first_token_ms,
+        })
     }
 
     fn observe_model_rerouted(&mut self, value: &Value) {
@@ -508,7 +606,7 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
-fn append_usage_record(record: &UsageRecord) -> io::Result<()> {
+fn append_record(record: &BridgeRecord) -> io::Result<()> {
     let Some(path) = usage_path() else {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -699,6 +797,20 @@ fn parent_process_executable() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    fn expect_usage(record: BridgeRecord) -> UsageRecord {
+        match record {
+            BridgeRecord::Usage(record) => record,
+            BridgeRecord::Timing(_) => panic!("expected usage record"),
+        }
+    }
+
+    fn expect_timing(record: BridgeRecord) -> TimingRecord {
+        match record {
+            BridgeRecord::Timing(record) => record,
+            BridgeRecord::Usage(_) => panic!("expected timing record"),
+        }
+    }
+
     fn fork_side_thread(state: &mut BridgeState) {
         state.observe_client_message(&serde_json::json!({
             "method": "thread/fork",
@@ -780,12 +892,12 @@ mod tests {
         assert!(state.observe_server_message(&inherited).is_none());
 
         start_turn(&mut state);
-        let first = state.observe_server_message(&usage(6000, 80, 40)).unwrap();
+        let first = expect_usage(state.observe_server_message(&usage(6000, 80, 40)).unwrap());
         assert_eq!(first.event_id, "codex_sidebar:usage-v1:side:turn-1:1");
         assert_eq!(first.usage.reasoning_output_tokens, 40);
 
         assert!(state.observe_server_message(&usage(6000, 80, 40)).is_none());
-        let second = state.observe_server_message(&usage(7000, 100, 60)).unwrap();
+        let second = expect_usage(state.observe_server_message(&usage(7000, 100, 60)).unwrap());
         assert_eq!(second.event_id, "codex_sidebar:usage-v1:side:turn-1:2");
         assert_eq!(second.usage.output_tokens, 100);
     }
@@ -814,11 +926,64 @@ mod tests {
             "params": {"threadId": "side", "turnId": "turn-1",
                        "fromModel": "gpt-5.6-sol", "toModel": "gpt-5.6-terra"}
         }));
-        let record = state.observe_server_message(&usage(6000, 80, 40)).unwrap();
+        let record = expect_usage(state.observe_server_message(&usage(6000, 80, 40)).unwrap());
         assert_eq!(record.model, "gpt-5.6-terra");
         let json = serde_json::to_string(&record).unwrap();
         assert!(!json.contains("prompt"));
         assert!(!json.contains("response"));
         assert!(!json.contains("input\""));
+    }
+
+    #[test]
+    fn records_turn_timing_for_the_final_usage_event_without_message_text() {
+        let mut state = BridgeState::default();
+        fork_side_thread(&mut state);
+        start_turn(&mut state);
+        let first = expect_usage(state.observe_server_message(&usage(6000, 80, 40)).unwrap());
+        let second = expect_usage(state.observe_server_message(&usage(7000, 100, 60)).unwrap());
+        assert_ne!(first.event_id, second.event_id);
+
+        state.observe_server_message(&serde_json::json!({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "side",
+                "turnId": "turn-1",
+                "itemId": "message-1",
+                "delta": "首字"
+            }
+        }));
+        let timing = expect_timing(
+            state
+                .observe_server_message(&serde_json::json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "side",
+                        "turn": {
+                            "id": "turn-1",
+                            "status": "completed",
+                            "items": [],
+                            "completedAt": 1_800_000_010i64,
+                            "durationMs": 4_200i64
+                        }
+                    }
+                }))
+                .unwrap(),
+        );
+        assert_eq!(timing.target_event_id, second.event_id);
+        assert_eq!(timing.duration_ms, 4_200);
+        assert!(timing.first_token_ms.is_some());
+        let json = serde_json::to_string(&BridgeRecord::Timing(timing)).unwrap();
+        assert!(!json.contains("首字"));
+        assert!(!json.contains("prompt"));
+        assert!(!json.contains("response"));
+        assert!(state
+            .observe_server_message(&serde_json::json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "side",
+                    "turn": {"id": "turn-1", "status": "completed", "items": [], "durationMs": 4_200}
+                }
+            }))
+            .is_none());
     }
 }

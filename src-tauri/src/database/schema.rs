@@ -314,11 +314,13 @@ impl Database {
                 last_line_offset INTEGER NOT NULL DEFAULT 0,
                 last_synced_at INTEGER NOT NULL,
                 last_byte_offset INTEGER,
-                last_tail_fingerprint INTEGER
+                last_tail_fingerprint INTEGER,
+                codex_timing_line_offset INTEGER NOT NULL DEFAULT 0
             )",
             [],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
+        Self::ensure_codex_timing_sync_column(conn)?;
 
         // Session detail rows are pruned after rollup, so request IDs needed
         // for fork/rewrite deduplication live in a compact durable ledger.
@@ -562,6 +564,7 @@ impl Database {
                 version = Self::get_user_version(conn)?;
             }
             Self::ensure_reasoning_output_token_columns(conn)?;
+            Self::ensure_codex_timing_sync_column(conn)?;
             Ok(())
         })();
 
@@ -3144,6 +3147,18 @@ impl Database {
         Ok(())
     }
 
+    fn ensure_codex_timing_sync_column(conn: &Connection) -> Result<(), AppError> {
+        if Self::table_exists(conn, "session_log_sync")? {
+            Self::add_column_if_missing(
+                conn,
+                "session_log_sync",
+                "codex_timing_line_offset",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+        Ok(())
+    }
+
     // --- 辅助方法 ---
 
     pub(crate) fn get_user_version(conn: &Connection) -> Result<i32, AppError> {
@@ -3500,6 +3515,11 @@ mod tests {
             "session_log_sync",
             "last_tail_fingerprint"
         )?);
+        assert!(Database::has_column(
+            &conn,
+            "session_log_sync",
+            "codex_timing_line_offset"
+        )?);
         let (byte_offset, fingerprint): (Option<i64>, Option<i64>) = conn.query_row(
             "SELECT last_byte_offset, last_tail_fingerprint
              FROM session_log_sync WHERE file_path = '/tmp/a.jsonl'",
@@ -3523,10 +3543,21 @@ mod tests {
             "CREATE TABLE usage_daily_rollups (date TEXT PRIMARY KEY)",
             [],
         )?;
+        conn.execute(
+            "CREATE TABLE session_log_sync (
+                file_path TEXT PRIMARY KEY,
+                last_modified INTEGER NOT NULL,
+                last_line_offset INTEGER NOT NULL DEFAULT 0,
+                last_synced_at INTEGER NOT NULL
+             )",
+            [],
+        )?;
         Database::set_user_version(&conn, SCHEMA_VERSION)?;
 
         Database::ensure_reasoning_output_token_columns(&conn)?;
         Database::ensure_reasoning_output_token_columns(&conn)?;
+        Database::ensure_codex_timing_sync_column(&conn)?;
+        Database::ensure_codex_timing_sync_column(&conn)?;
 
         assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
         assert!(Database::has_column(
@@ -3538,6 +3569,11 @@ mod tests {
             &conn,
             "usage_daily_rollups",
             "reasoning_output_tokens"
+        )?);
+        assert!(Database::has_column(
+            &conn,
+            "session_log_sync",
+            "codex_timing_line_offset"
         )?);
         Ok(())
     }

@@ -27,6 +27,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const CODEX_SIDEBAR_USAGE_PATH_ENV: &str = "CC_SWITCH_CODEX_SIDEBAR_USAGE_PATH";
 pub const CODEX_SIDEBAR_USAGE_FILE: &str = "codex-sidebar-usage.jsonl";
 const EVENT_ID_PREFIX: &str = "codex_sidebar:usage-v1:";
+const TIMING_EVENT_ID_PREFIX: &str = "codex_sidebar:timing-v1:";
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum SidebarSpoolEvent {
+    Usage(SidebarUsageEvent),
+    Timing(SidebarTimingEvent),
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +59,20 @@ struct SidebarTokenUsage {
     reasoning_output_tokens: u64,
     #[allow(dead_code)]
     total_tokens: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SidebarTimingEvent {
+    schema_version: u32,
+    event_id: String,
+    target_event_id: String,
+    thread_id: String,
+    turn_id: String,
+    #[allow(dead_code)]
+    completed_at_ms: i64,
+    duration_ms: u64,
+    first_token_ms: Option<u64>,
 }
 
 impl SidebarUsageEvent {
@@ -85,6 +107,45 @@ impl SidebarUsageEvent {
             model: Some(self.model.clone()),
             message_id: None,
         })
+    }
+}
+
+impl SidebarTimingEvent {
+    fn validate(&self) -> Result<(), String> {
+        if self.schema_version != 1 {
+            return Err(format!("unsupported schemaVersion {}", self.schema_version));
+        }
+        if !self.event_id.starts_with(TIMING_EVENT_ID_PREFIX) {
+            return Err("invalid timing eventId namespace".to_string());
+        }
+        if !self.target_event_id.starts_with(EVENT_ID_PREFIX) {
+            return Err("invalid targetEventId namespace".to_string());
+        }
+        if self.thread_id.trim().is_empty() || self.turn_id.trim().is_empty() {
+            return Err("threadId and turnId are required".to_string());
+        }
+        let expected_target_prefix =
+            format!("{EVENT_ID_PREFIX}{}:{}:", self.thread_id, self.turn_id);
+        if !self.target_event_id.starts_with(&expected_target_prefix) {
+            return Err("targetEventId does not match threadId/turnId".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl SidebarSpoolEvent {
+    fn event_id(&self) -> &str {
+        match self {
+            Self::Usage(event) => &event.event_id,
+            Self::Timing(event) => &event.event_id,
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Usage(event) => event.validate(),
+            Self::Timing(event) => event.validate(),
+        }
     }
 }
 
@@ -180,7 +241,7 @@ fn sync_codex_sidebar_usage_file(
             continue;
         }
 
-        let event = match serde_json::from_slice::<SidebarUsageEvent>(&bytes) {
+        let event = match serde_json::from_slice::<SidebarSpoolEvent>(&bytes) {
             Ok(event) => event,
             Err(error) => {
                 result.skipped = result.skipped.saturating_add(1);
@@ -196,7 +257,7 @@ fn sync_codex_sidebar_usage_file(
             result.skipped = result.skipped.saturating_add(1);
             result.errors.push(format!(
                 "Codex sidebar usage event {} skipped: {error}",
-                event.event_id
+                event.event_id()
             ));
             continue;
         }
@@ -213,15 +274,29 @@ fn sync_codex_sidebar_usage_file(
         .map_err(|error| AppError::Database(format!("start Codex sidebar batch: {error}")))?;
     let mut pricing = HashMap::new();
     for event in &events {
-        match insert_sidebar_usage_on_conn(&tx, event, &mut pricing) {
-            Ok(true) => result.imported = result.imported.saturating_add(1),
-            Ok(false) => result.skipped = result.skipped.saturating_add(1),
-            Err(error) => {
-                result.skipped = result.skipped.saturating_add(1);
-                result
-                    .errors
-                    .push(format!("Codex sidebar event {}: {error}", event.event_id));
+        match event {
+            SidebarSpoolEvent::Usage(event) => {
+                match insert_sidebar_usage_on_conn(&tx, event, &mut pricing) {
+                    Ok(true) => result.imported = result.imported.saturating_add(1),
+                    Ok(false) => result.skipped = result.skipped.saturating_add(1),
+                    Err(error) => {
+                        result.skipped = result.skipped.saturating_add(1);
+                        result
+                            .errors
+                            .push(format!("Codex sidebar event {}: {error}", event.event_id));
+                    }
+                }
             }
+            SidebarSpoolEvent::Timing(event) => match apply_sidebar_timing_on_conn(&tx, event) {
+                Ok(true) => result.imported = result.imported.saturating_add(1),
+                Ok(false) => {}
+                Err(error) => {
+                    result.skipped = result.skipped.saturating_add(1);
+                    result
+                        .errors
+                        .push(format!("Codex sidebar timing {}: {error}", event.event_id));
+                }
+            },
         }
     }
     update_sync_state_on_conn(&tx, &path_key, modified, processed_offset)?;
@@ -236,6 +311,43 @@ fn sync_codex_sidebar_usage_file(
         );
     }
     Ok(result)
+}
+
+fn apply_sidebar_timing_on_conn(
+    conn: &rusqlite::Connection,
+    event: &SidebarTimingEvent,
+) -> Result<bool, AppError> {
+    let duration_ms = event.duration_ms.min(i64::MAX as u64) as i64;
+    let first_token_ms = event
+        .first_token_ms
+        .map(|value| value.min(i64::MAX as u64) as i64);
+    let updated = conn
+        .prepare_cached(
+            "UPDATE proxy_request_logs
+                SET latency_ms = ?2,
+                    first_token_ms = ?3,
+                    duration_ms = ?2
+              WHERE request_id = ?1
+                AND data_source = 'codex_sidebar'
+                AND session_id = ?4
+                AND (
+                    latency_ms != ?2
+                    OR first_token_ms IS NOT ?3
+                    OR duration_ms IS NOT ?2
+                )",
+        )
+        .and_then(|mut statement| {
+            statement.execute(rusqlite::params![
+                event.target_event_id,
+                duration_ms,
+                first_token_ms,
+                event.thread_id
+            ])
+        })
+        .map_err(|error| {
+            AppError::Database(format!("update Codex sidebar timing failed: {error}"))
+        })?;
+    Ok(updated > 0)
 }
 
 fn insert_sidebar_usage_on_conn(
@@ -467,6 +579,23 @@ mod tests {
         })
     }
 
+    fn timing_event(
+        target_event_id: &str,
+        duration_ms: u64,
+        first_token_ms: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "schemaVersion": 1,
+            "eventId": "codex_sidebar:timing-v1:thread-side:turn-side",
+            "targetEventId": target_event_id,
+            "threadId": "thread-side",
+            "turnId": "turn-side",
+            "completedAtMs": 1_800_000_010_000i64,
+            "durationMs": duration_ms,
+            "firstTokenMs": first_token_ms
+        })
+    }
+
     fn append_value(path: &Path, value: &serde_json::Value) {
         let mut file = fs::OpenOptions::new()
             .create(true)
@@ -531,6 +660,47 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
         assert_eq!(row, (2, 170, 90, INPUT_TOKEN_SEMANTICS_TOTAL));
+        Ok(())
+    }
+
+    #[test]
+    fn late_timing_event_updates_only_the_final_sidebar_usage_row() -> Result<(), AppError> {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sidebar.jsonl");
+        let first_id = "codex_sidebar:usage-v1:thread-side:turn-side:1";
+        let final_id = "codex_sidebar:usage-v1:thread-side:turn-side:2";
+        append_value(&path, &event(first_id, 1000, 80, 40));
+        append_value(&path, &event(final_id, 1200, 90, 50));
+        let db = Database::memory()?;
+        assert_eq!(sync_codex_sidebar_usage_file(&db, &path)?.imported, 2);
+
+        append_value(&path, &timing_event(final_id, 4_200, 700));
+        assert_eq!(sync_codex_sidebar_usage_file(&db, &path)?.imported, 1);
+
+        let conn = lock_conn!(db.conn);
+        let rows = conn
+            .prepare(
+                "SELECT request_id, latency_ms, first_token_ms, duration_ms
+                   FROM proxy_request_logs
+                  WHERE data_source = 'codex_sidebar'
+                  ORDER BY request_id",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            rows,
+            vec![
+                (first_id.to_string(), 0, None, None),
+                (final_id.to_string(), 4_200, Some(700), Some(4_200)),
+            ]
+        );
         Ok(())
     }
 

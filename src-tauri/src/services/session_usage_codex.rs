@@ -18,9 +18,7 @@ use crate::database::{lock_conn, Database};
 use crate::error::AppError;
 use crate::proxy::usage::calculator::{CostCalculator, ModelPricing};
 use crate::proxy::usage::parser::TokenUsage;
-use crate::services::session_usage::{
-    metadata_modified_nanos, update_sync_state, update_sync_state_on_conn, SessionSyncResult,
-};
+use crate::services::session_usage::{metadata_modified_nanos, SessionSyncResult};
 use crate::services::usage_stats::{
     find_model_pricing, has_suspected_codex_session_duplicate, should_skip_session_insert, DedupKey,
 };
@@ -205,6 +203,14 @@ struct ParsedTokenEvent {
     event_index: Option<u32>,
     model: String,
     timestamp: Option<String>,
+    timing: Option<TurnTiming>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TurnTiming {
+    line_offset: i64,
+    duration_ms: u64,
+    first_token_ms: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -465,6 +471,17 @@ fn parse_timestamp(value: Option<&serde_json::Value>) -> Option<DateTime<Utc>> {
         .map(|value| value.with_timezone(&Utc))
 }
 
+fn nonnegative_u64(value: Option<&serde_json::Value>) -> Option<u64> {
+    value.and_then(|value| {
+        value.as_u64().or_else(|| {
+            value
+                .as_i64()
+                .filter(|value| *value >= 0)
+                .map(|value| value as u64)
+        })
+    })
+}
+
 fn reasoning_output_tokens(value: &serde_json::Value) -> Option<u64> {
     value
         .get("reasoning_output_tokens")
@@ -529,7 +546,7 @@ fn token_snapshot_source(payload: &serde_json::Value) -> Option<String> {
 /// - `pricing`：模型定价 pass 级缓存。定价表在 pass 进行中被修改时本 pass
 ///   仍用旧价，下一个同步 pass 生效。
 struct CodexSyncPass {
-    cursors: HashMap<String, (i64, i64)>,
+    cursors: HashMap<String, (i64, i64, i64)>,
     pricing: HashMap<String, Option<ModelPricing>>,
 }
 
@@ -537,13 +554,21 @@ impl CodexSyncPass {
     fn load(db: &Database) -> Result<Self, AppError> {
         let conn = lock_conn!(db.conn);
         let mut stmt = conn
-            .prepare("SELECT file_path, last_modified, last_line_offset FROM session_log_sync")
+            .prepare(
+                "SELECT file_path, last_modified, last_line_offset,
+                        codex_timing_line_offset
+                   FROM session_log_sync",
+            )
             .map_err(|e| AppError::Database(format!("预载同步游标失败: {e}")))?;
         let cursors = stmt
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?),
+                    (
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ),
                 ))
             })
             .and_then(|rows| rows.collect::<Result<HashMap<_, _>, _>>())
@@ -558,11 +583,11 @@ impl CodexSyncPass {
 fn get_codex_sync_state(
     db: &Database,
     file_path: &Path,
-    cursors: &HashMap<String, (i64, i64)>,
-) -> Result<(i64, i64), AppError> {
+    cursors: &HashMap<String, (i64, i64, i64)>,
+) -> Result<(i64, i64, i64), AppError> {
     let file_path_str = file_path.to_string_lossy().to_string();
-    let state = cursors.get(&file_path_str).copied().unwrap_or((0, 0));
-    if state != (0, 0)
+    let state = cursors.get(&file_path_str).copied().unwrap_or((0, 0, 0));
+    if state != (0, 0, 0)
         || file_path
             .parent()
             .and_then(Path::file_name)
@@ -585,16 +610,62 @@ fn get_codex_sync_state(
             path.as_str() != file_path_str
                 && (path.ends_with(&slash_suffix) || path.ends_with(&backslash_suffix))
         })
-        .map(|(_, &(modified, offset))| (offset, modified))
-        .max();
+        .map(|(_, &(modified, offset, timing_offset))| ((offset, modified), timing_offset))
+        .max_by_key(|((offset, modified), _)| (*offset, *modified));
 
     match inherited {
-        Some((offset, modified)) => {
-            update_sync_state(db, &file_path_str, modified, offset)?;
-            Ok((modified, offset))
+        Some(((offset, modified), timing_offset)) => {
+            update_codex_sync_state(db, &file_path_str, modified, offset, timing_offset)?;
+            Ok((modified, offset, timing_offset))
         }
         None => Ok(state),
     }
+}
+
+fn update_codex_sync_state(
+    db: &Database,
+    file_path: &str,
+    last_modified: i64,
+    last_offset: i64,
+    timing_offset: i64,
+) -> Result<(), AppError> {
+    let conn = lock_conn!(db.conn);
+    update_codex_sync_state_on_conn(&conn, file_path, last_modified, last_offset, timing_offset)
+}
+
+fn update_codex_sync_state_on_conn(
+    conn: &rusqlite::Connection,
+    file_path: &str,
+    last_modified: i64,
+    last_offset: i64,
+    timing_offset: i64,
+) -> Result<(), AppError> {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    conn.prepare_cached(
+        "INSERT INTO session_log_sync (
+             file_path, last_modified, last_line_offset, last_synced_at,
+             codex_timing_line_offset
+         ) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(file_path) DO UPDATE SET
+             last_modified = excluded.last_modified,
+             last_line_offset = excluded.last_line_offset,
+             last_synced_at = excluded.last_synced_at,
+             codex_timing_line_offset = excluded.codex_timing_line_offset",
+    )
+    .and_then(|mut statement| {
+        statement.execute(rusqlite::params![
+            file_path,
+            last_modified,
+            last_offset,
+            now,
+            timing_offset
+        ])
+    })
+    .map_err(|error| AppError::Database(format!("更新 Codex 同步状态失败: {error}")))?;
+    Ok(())
 }
 
 /// 归一化 Codex 模型名
@@ -841,7 +912,9 @@ fn parse_codex_file(
     let mut last_signature_by_source: HashMap<Option<String>, TokenUsageSignature> = HashMap::new();
     let mut previous_token_signature = None;
     let mut event_index = 0u32;
-    let mut token_events = Vec::new();
+    let mut token_events: Vec<ParsedTokenEvent> = Vec::new();
+    let mut active_turn_id: Option<String> = None;
+    let mut last_billable_event_by_turn: HashMap<String, usize> = HashMap::new();
     let mut line_offset = 0i64;
     let mut has_billable_tokens = false;
 
@@ -861,7 +934,11 @@ fn parse_codex_file(
         if !is_event_msg && !is_turn_context && !is_session_meta {
             continue;
         }
-        if is_event_msg && !line.contains("\"token_count\"") {
+        if is_event_msg
+            && !line.contains("\"token_count\"")
+            && !line.contains("\"task_started\"")
+            && !line.contains("\"task_complete\"")
+        {
             continue;
         }
 
@@ -913,6 +990,14 @@ fn parse_codex_file(
             }
             "turn_context" => {
                 if let Some(payload) = value.get("payload") {
+                    if let Some(turn_id) = non_empty_string(
+                        payload
+                            .get("turn_id")
+                            .or_else(|| payload.get("turnId"))
+                            .or_else(|| payload.get("turn").and_then(|turn| turn.get("id"))),
+                    ) {
+                        active_turn_id = Some(turn_id);
+                    }
                     if let Some(model) = payload
                         .get("model")
                         .or_else(|| payload.get("info").and_then(|info| info.get("model")))
@@ -926,7 +1011,49 @@ fn parse_codex_file(
                 let Some(payload) = value.get("payload") else {
                     continue;
                 };
-                if payload.get("type").and_then(serde_json::Value::as_str) != Some("token_count") {
+                let payload_type = payload.get("type").and_then(serde_json::Value::as_str);
+                if payload_type == Some("task_started") {
+                    active_turn_id = non_empty_string(
+                        payload
+                            .get("turn_id")
+                            .or_else(|| payload.get("turnId"))
+                            .or_else(|| payload.get("turn").and_then(|turn| turn.get("id"))),
+                    );
+                    continue;
+                }
+                if payload_type == Some("task_complete") {
+                    let turn_id = non_empty_string(
+                        payload
+                            .get("turn_id")
+                            .or_else(|| payload.get("turnId"))
+                            .or_else(|| payload.get("turn").and_then(|turn| turn.get("id"))),
+                    );
+                    let duration_ms = nonnegative_u64(
+                        payload
+                            .get("duration_ms")
+                            .or_else(|| payload.get("durationMs")),
+                    );
+                    if let (Some(turn_id), Some(duration_ms)) = (turn_id.as_deref(), duration_ms) {
+                        if let Some(&event_position) = last_billable_event_by_turn.get(turn_id) {
+                            let first_token_ms = nonnegative_u64(
+                                payload
+                                    .get("time_to_first_token_ms")
+                                    .or_else(|| payload.get("timeToFirstTokenMs")),
+                            )
+                            .filter(|first_token_ms| *first_token_ms <= duration_ms);
+                            token_events[event_position].timing = Some(TurnTiming {
+                                line_offset,
+                                duration_ms,
+                                first_token_ms,
+                            });
+                        }
+                    }
+                    if active_turn_id.as_deref() == turn_id.as_deref() {
+                        active_turn_id = None;
+                    }
+                    continue;
+                }
+                if payload_type != Some("token_count") {
                     continue;
                 }
                 let Some(info) = payload.get("info").filter(|info| !info.is_null()) else {
@@ -1015,7 +1142,13 @@ fn parse_codex_file(
                         .get("timestamp")
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_owned),
+                    timing: None,
                 });
+                if nonzero_index.is_some() {
+                    if let Some(turn_id) = active_turn_id.as_ref() {
+                        last_billable_event_by_turn.insert(turn_id.clone(), token_events.len() - 1);
+                    }
+                }
             }
             _ => {}
         }
@@ -1211,12 +1344,15 @@ fn sync_single_codex_file(
     let file_size = metadata.len();
 
     // 检查同步状态
-    let (last_modified, last_offset) = get_codex_sync_state(db, file_path, &pass.cursors)?;
+    let (last_modified, last_offset, last_timing_offset) =
+        get_codex_sync_state(db, file_path, &pass.cursors)?;
 
     // Windows 上持续打开的 rollout 在追加期间可能只增长文件长度，而 mtime
     // 直到写句柄关闭才变化。不能只依赖 mtime，否则同一会话后续 token_count
     // 会一直等到文件关闭才批量导入。
-    if !changed_since_last_codex_scan(file_path, file_modified, file_size, last_modified) {
+    if !changed_since_last_codex_scan(file_path, file_modified, file_size, last_modified)
+        && last_timing_offset >= last_offset
+    {
         return Ok(CodexFileSyncResult::default());
     }
 
@@ -1249,7 +1385,13 @@ fn sync_single_codex_file(
 
     let parsed = parse_codex_file(file_path, thread_id_from_filename(file_path))?;
     if !parsed.has_billable_tokens {
-        update_sync_state(db, &file_path_str, file_modified, parsed.line_offset)?;
+        update_codex_sync_state(
+            db,
+            &file_path_str,
+            file_modified,
+            parsed.line_offset,
+            parsed.line_offset,
+        )?;
         remember_codex_file_scan(file_path, file_modified, file_size);
         return Ok(CodexFileSyncResult::default());
     }
@@ -1345,6 +1487,7 @@ fn sync_single_codex_file(
 
     let mut result = CodexFileSyncResult::default();
     let mut to_insert: Vec<(&ParsedTokenEvent, u32)> = Vec::new();
+    let mut timing_updates: Vec<(u32, TurnTiming)> = Vec::new();
     for (token_offset, event) in parsed.token_events.iter().enumerate() {
         let Some(event_index) = event.event_index else {
             continue;
@@ -1354,6 +1497,12 @@ fn sync_single_codex_file(
                 result.skipped = result.skipped.saturating_add(1);
             }
             continue;
+        }
+        if let Some(timing) = event
+            .timing
+            .filter(|timing| timing.line_offset > last_timing_offset)
+        {
+            timing_updates.push((event_index, timing));
         }
         if event.line_offset <= last_offset {
             continue;
@@ -1386,6 +1535,7 @@ fn sync_single_codex_file(
                 &event.model,
                 Some(root_thread_id),
                 event.timestamp.as_deref(),
+                event.timing.as_ref(),
                 &mut batch_suspected,
                 &mut pass.pricing,
             ) {
@@ -1398,9 +1548,20 @@ fn sync_single_codex_file(
             }
         }
         if is_last_batch {
+            batch_imported = batch_imported.saturating_add(apply_codex_timing_updates_on_conn(
+                &tx,
+                root_thread_id,
+                &timing_updates,
+            )?);
             // 游标推进与最后一批数据同事务提交：中途崩溃时两者一起回滚，
             // 不会出现"游标已推进但数据缺失"的丢数据窗口。
-            update_sync_state_on_conn(&tx, &file_path_str, file_modified, parsed.line_offset)?;
+            update_codex_sync_state_on_conn(
+                &tx,
+                &file_path_str,
+                file_modified,
+                parsed.line_offset,
+                parsed.line_offset,
+            )?;
         }
         tx.commit()
             .map_err(|e| AppError::Database(format!("提交 Codex 会话写入事务失败: {e}")))?;
@@ -1411,10 +1572,60 @@ fn sync_single_codex_file(
     }
 
     if to_insert.is_empty() {
-        update_sync_state(db, &file_path_str, file_modified, parsed.line_offset)?;
+        let conn = lock_conn!(db.conn);
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| AppError::Database(format!("开启 Codex timing 写入事务失败: {e}")))?;
+        let timing_updated =
+            apply_codex_timing_updates_on_conn(&tx, root_thread_id, &timing_updates)?;
+        update_codex_sync_state_on_conn(
+            &tx,
+            &file_path_str,
+            file_modified,
+            parsed.line_offset,
+            parsed.line_offset,
+        )?;
+        tx.commit()
+            .map_err(|e| AppError::Database(format!("提交 Codex timing 写入事务失败: {e}")))?;
+        result.imported = result.imported.saturating_add(timing_updated);
     }
     remember_codex_file_scan(file_path, file_modified, file_size);
     Ok(result)
+}
+
+fn apply_codex_timing_updates_on_conn(
+    conn: &rusqlite::Connection,
+    root_thread_id: &str,
+    timings: &[(u32, TurnTiming)],
+) -> Result<u32, AppError> {
+    let mut updated = 0u32;
+    let mut statement = conn
+        .prepare_cached(
+            "UPDATE proxy_request_logs
+                SET latency_ms = ?2,
+                    first_token_ms = ?3,
+                    duration_ms = ?2
+              WHERE request_id = ?1
+                AND data_source = 'codex_session'
+                AND (
+                    latency_ms != ?2
+                    OR first_token_ms IS NOT ?3
+                    OR duration_ms IS NOT ?2
+                )",
+        )
+        .map_err(|error| AppError::Database(format!("准备 Codex timing 更新失败: {error}")))?;
+    for (event_index, timing) in timings {
+        let request_id = format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{root_thread_id}:{event_index}");
+        let duration_ms = timing.duration_ms.min(i64::MAX as u64) as i64;
+        let first_token_ms = timing
+            .first_token_ms
+            .map(|value| value.min(i64::MAX as u64) as i64);
+        let changed = statement
+            .execute(rusqlite::params![request_id, duration_ms, first_token_ms])
+            .map_err(|error| AppError::Database(format!("更新 Codex timing 失败: {error}")))?;
+        updated = updated.saturating_add(changed as u32);
+    }
+    Ok(updated)
 }
 
 /// 插入单条 Codex 会话记录到 proxy_request_logs（自取锁的便捷包装，测试专用；
@@ -1437,6 +1648,7 @@ fn insert_codex_session_entry(
         model,
         session_id,
         timestamp,
+        None,
         suspected_duplicates,
         &mut HashMap::new(),
     )
@@ -1455,6 +1667,7 @@ fn insert_codex_session_entry_on_conn(
     model: &str,
     session_id: Option<&str>,
     timestamp: Option<&str>,
+    timing: Option<&TurnTiming>,
     suspected_duplicates: &mut u32,
     pricing_cache: &mut HashMap<String, Option<ModelPricing>>,
 ) -> Result<bool, AppError> {
@@ -1530,6 +1743,10 @@ fn insert_codex_session_entry_on_conn(
             "0".to_string(),
         ),
     };
+    let duration_ms = timing.map(|timing| timing.duration_ms.min(i64::MAX as u64) as i64);
+    let first_token_ms = timing
+        .and_then(|timing| timing.first_token_ms)
+        .map(|value| value.min(i64::MAX as u64) as i64);
 
     let inserted_rows = conn
         .prepare_cached(
@@ -1537,9 +1754,9 @@ fn insert_codex_session_entry_on_conn(
             request_id, provider_id, app_type, model, request_model,
             input_tokens, output_tokens, reasoning_output_tokens, cache_read_tokens, cache_creation_tokens,
             input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
-            latency_ms, first_token_ms, status_code, error_message, session_id,
+            latency_ms, first_token_ms, duration_ms, status_code, error_message, session_id,
             provider_type, is_streaming, cost_multiplier, created_at, data_source
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
         )
         .and_then(|mut stmt| stmt.execute(rusqlite::params![
                 request_id,
@@ -1557,8 +1774,9 @@ fn insert_codex_session_entry_on_conn(
                 cache_read_cost,
                 cache_creation_cost,
                 total_cost,
-                0i64,                // latency_ms
-                Option::<i64>::None, // first_token_ms
+                duration_ms.unwrap_or(0), // latency_ms
+                first_token_ms,
+                duration_ms,
                 200i64,              // status_code
                 Option::<String>::None, // error_message
                 session_id.map(|s| s.to_string()),
@@ -1648,6 +1866,35 @@ mod tests {
 
     fn turn_context() -> serde_json::Value {
         turn_context_at("2026-07-10T03:00:01Z")
+    }
+
+    fn task_started(turn_id: &str, timestamp: &str) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": {
+                "type": "task_started",
+                "turn_id": turn_id
+            }
+        })
+    }
+
+    fn task_complete(
+        turn_id: &str,
+        duration_ms: u64,
+        first_token_ms: Option<u64>,
+        timestamp: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "turn_id": turn_id,
+                "duration_ms": duration_ms,
+                "time_to_first_token_ms": first_token_ms
+            }
+        })
     }
 
     fn token_count_at(input: u64, cached: u64, output: u64, timestamp: &str) -> serde_json::Value {
@@ -2303,6 +2550,183 @@ mod tests {
     fn test_collect_codex_session_files_nonexistent() {
         let files = collect_codex_session_files(Path::new("/nonexistent/path"));
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_task_complete_attaches_timing_only_to_final_token_event() -> Result<(), AppError> {
+        let dir = tempdir().unwrap();
+        let file = rollout_path(dir.path(), PARENT_ID);
+        let turn_id = "00000000-0000-4000-8000-000000000099";
+        write_jsonl(
+            &file,
+            &[
+                session_meta(PARENT_ID),
+                task_started(turn_id, "2026-07-10T03:00:01Z"),
+                turn_context(),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:02Z"),
+                token_count_at(200, 100, 20, "2026-07-10T03:00:03Z"),
+                task_complete(turn_id, 4_200, Some(1_300), "2026-07-10T03:00:04Z"),
+            ],
+        );
+
+        let parsed = parse_codex_file(&file, Some(PARENT_ID.to_string()))?;
+        let billable = parsed
+            .token_events
+            .iter()
+            .filter(|event| event.event_index.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(billable.len(), 2);
+        assert_eq!(billable[0].timing, None);
+        assert_eq!(
+            billable[1].timing,
+            Some(TurnTiming {
+                line_offset: 6,
+                duration_ms: 4_200,
+                first_token_ms: Some(1_300),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_codex_timing_is_stored_only_on_final_turn_row() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let dir = tempdir().unwrap();
+        let file = rollout_path(dir.path(), PARENT_ID);
+        let turn_id = "00000000-0000-4000-8000-000000000099";
+        write_jsonl(
+            &file,
+            &[
+                session_meta(PARENT_ID),
+                task_started(turn_id, "2026-07-10T03:00:01Z"),
+                turn_context(),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:02Z"),
+                token_count_at(200, 100, 20, "2026-07-10T03:00:03Z"),
+                task_complete(turn_id, 4_200, Some(1_300), "2026-07-10T03:00:04Z"),
+            ],
+        );
+
+        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 2);
+        let conn = lock_conn!(db.conn);
+        let rows = conn
+            .prepare(
+                "SELECT latency_ms, first_token_ms, duration_ms
+                   FROM proxy_request_logs
+                  WHERE data_source = 'codex_session'
+                  ORDER BY request_id",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            rows,
+            vec![(0, None, None), (4_200, Some(1_300), Some(4_200))]
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_late_task_complete_updates_existing_row_without_reimport() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let dir = tempdir().unwrap();
+        let file = rollout_path(dir.path(), PARENT_ID);
+        let turn_id = "00000000-0000-4000-8000-000000000099";
+        write_jsonl(
+            &file,
+            &[
+                session_meta(PARENT_ID),
+                task_started(turn_id, "2026-07-10T03:00:01Z"),
+                turn_context(),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:02Z"),
+            ],
+        );
+        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 1);
+
+        let original_modified = fs::metadata(&file).unwrap().modified().unwrap();
+        let mut writer = fs::OpenOptions::new().append(true).open(&file).unwrap();
+        writeln!(
+            writer,
+            "{}",
+            task_complete(turn_id, 5_500, Some(900), "2026-07-10T03:00:05Z")
+        )
+        .unwrap();
+        writer.flush().unwrap();
+        writer
+            .set_times(fs::FileTimes::new().set_modified(original_modified))
+            .unwrap();
+        drop(writer);
+
+        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 1);
+        let conn = lock_conn!(db.conn);
+        let timing: (i64, Option<i64>, Option<i64>) = conn.query_row(
+            "SELECT latency_ms, first_token_ms, duration_ms
+               FROM proxy_request_logs
+              WHERE data_source = 'codex_session'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(timing, (5_500, Some(900), Some(5_500)));
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_timing_cursor_backfills_unchanged_historical_file() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let dir = tempdir().unwrap();
+        let file = rollout_path(dir.path(), PARENT_ID);
+        let turn_id = "00000000-0000-4000-8000-000000000099";
+        write_jsonl(
+            &file,
+            &[
+                session_meta(PARENT_ID),
+                task_started(turn_id, "2026-07-10T03:00:01Z"),
+                turn_context(),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:02Z"),
+                task_complete(turn_id, 6_000, Some(1_200), "2026-07-10T03:00:05Z"),
+            ],
+        );
+        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 1);
+
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "UPDATE proxy_request_logs
+                    SET latency_ms = 0, first_token_ms = NULL, duration_ms = NULL
+                  WHERE data_source = 'codex_session'",
+                [],
+            )?;
+            conn.execute(
+                "UPDATE session_log_sync
+                    SET codex_timing_line_offset = 0
+                  WHERE file_path = ?1",
+                [file.to_string_lossy().as_ref()],
+            )?;
+        }
+
+        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 1);
+        let conn = lock_conn!(db.conn);
+        let timing: (i64, Option<i64>, Option<i64>, i64) = conn.query_row(
+            "SELECT l.latency_ms, l.first_token_ms, l.duration_ms,
+                    s.codex_timing_line_offset
+               FROM proxy_request_logs l
+               JOIN session_log_sync s ON s.file_path = ?1
+              WHERE l.data_source = 'codex_session'",
+            [file.to_string_lossy().as_ref()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(timing, (6_000, Some(1_200), Some(6_000), 5));
+        Ok(())
     }
 
     #[test]
