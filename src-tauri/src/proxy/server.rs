@@ -416,7 +416,6 @@ impl ProxyServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::AppError;
     use crate::provider::{Provider, ProviderMeta};
     use axum::http::{header, HeaderMap, StatusCode};
     use rusqlite::OptionalExtension;
@@ -714,7 +713,7 @@ mod tests {
         let mut recorded = None;
         for _ in 0..50 {
             recorded = {
-                let conn = crate::database::lock_conn!(db.conn);
+                let conn = db.conn.lock().expect("lock test database");
                 conn.query_row(
                     "SELECT input_tokens, output_tokens, reasoning_output_tokens,
                             cache_read_tokens, is_streaming, first_token_ms
