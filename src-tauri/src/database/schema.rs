@@ -1146,10 +1146,7 @@ impl Database {
                 "TEXT NOT NULL DEFAULT 'response'",
             )?;
         }
-        if Self::table_exists(conn, "proxy_request_logs")?
-            && Self::has_column(conn, "proxy_request_logs", "data_source")?
-            && Self::has_column(conn, "proxy_request_logs", "latency_ms")?
-        {
+        if Self::table_exists(conn, "proxy_request_logs")? {
             Self::add_column_if_missing(conn, "proxy_request_logs", "request_model", "TEXT")?;
         }
 
@@ -1438,11 +1435,7 @@ impl Database {
                 "INTEGER NOT NULL DEFAULT 0",
             )?;
         }
-        if Self::table_exists(conn, "usage_daily_rollups")?
-            && Self::has_column(conn, "usage_daily_rollups", "app_type")?
-            && Self::has_column(conn, "usage_daily_rollups", "provider_id")?
-            && Self::has_column(conn, "usage_daily_rollups", "avg_latency_ms")?
-        {
+        if Self::table_exists(conn, "usage_daily_rollups")? {
             Self::add_column_if_missing(
                 conn,
                 "usage_daily_rollups",
@@ -3188,7 +3181,10 @@ impl Database {
     }
 
     fn normalize_codex_turn_timing_latency(conn: &Connection) -> Result<(), AppError> {
-        if Self::table_exists(conn, "proxy_request_logs")? {
+        if Self::table_exists(conn, "proxy_request_logs")?
+            && Self::has_column(conn, "proxy_request_logs", "data_source")?
+            && Self::has_column(conn, "proxy_request_logs", "latency_ms")?
+        {
             conn.execute(
                 "UPDATE proxy_request_logs
                     SET latency_ms = 0
@@ -3198,7 +3194,11 @@ impl Database {
             )
             .map_err(|error| AppError::Database(format!("修正 Codex 整轮用时字段失败: {error}")))?;
         }
-        if Self::table_exists(conn, "usage_daily_rollups")? {
+        if Self::table_exists(conn, "usage_daily_rollups")?
+            && Self::has_column(conn, "usage_daily_rollups", "app_type")?
+            && Self::has_column(conn, "usage_daily_rollups", "provider_id")?
+            && Self::has_column(conn, "usage_daily_rollups", "avg_latency_ms")?
+        {
             conn.execute(
                 "UPDATE usage_daily_rollups
                     SET avg_latency_ms = 0
