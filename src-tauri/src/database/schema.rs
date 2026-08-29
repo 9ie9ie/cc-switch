@@ -1146,7 +1146,10 @@ impl Database {
                 "TEXT NOT NULL DEFAULT 'response'",
             )?;
         }
-        if Self::table_exists(conn, "proxy_request_logs")? {
+        if Self::table_exists(conn, "proxy_request_logs")?
+            && Self::has_column(conn, "proxy_request_logs", "data_source")?
+            && Self::has_column(conn, "proxy_request_logs", "latency_ms")?
+        {
             Self::add_column_if_missing(conn, "proxy_request_logs", "request_model", "TEXT")?;
         }
 
@@ -1435,7 +1438,11 @@ impl Database {
                 "INTEGER NOT NULL DEFAULT 0",
             )?;
         }
-        if Self::table_exists(conn, "usage_daily_rollups")? {
+        if Self::table_exists(conn, "usage_daily_rollups")?
+            && Self::has_column(conn, "usage_daily_rollups", "app_type")?
+            && Self::has_column(conn, "usage_daily_rollups", "provider_id")?
+            && Self::has_column(conn, "usage_daily_rollups", "avg_latency_ms")?
+        {
             Self::add_column_if_missing(
                 conn,
                 "usage_daily_rollups",
