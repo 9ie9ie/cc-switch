@@ -8,7 +8,7 @@ use crate::error::AppError;
 use crate::proxy::usage::calculator::{CostCalculator, ModelPricing};
 use crate::proxy::usage::parser::TokenUsage;
 use crate::services::session_usage::{
-    get_sync_state, metadata_modified_nanos, update_sync_state_on_conn, SessionSyncResult,
+    load_sync_cursors, metadata_modified_nanos, update_sync_state_on_conn, SessionSyncResult,
 };
 use crate::services::sql_helpers::INPUT_TOKEN_SEMANTICS_TOTAL;
 use crate::services::usage_stats::{
@@ -181,7 +181,10 @@ fn sync_codex_sidebar_usage_file(
     let modified = metadata_modified_nanos(&metadata);
     let file_len = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
     let path_key = path.to_string_lossy().to_string();
-    let (last_modified, saved_offset) = get_sync_state(db, &path_key)?;
+    let cursors = load_sync_cursors(db)?;
+    let cursor = cursors.get(&path_key);
+    let last_modified = cursor.map_or(0, |cursor| cursor.last_modified);
+    let saved_offset = cursor.map_or(0, |cursor| cursor.last_line_offset);
 
     if modified == last_modified && saved_offset == file_len {
         return Ok(SessionSyncResult {
@@ -557,6 +560,7 @@ fn merge_reasoning_into_matching_codex_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::session_usage::get_sync_state;
     use std::io::Write;
     use tempfile::tempdir;
 

@@ -786,7 +786,8 @@ mod tests {
         let lines = vec![usage_event_line(OLD_EPOCH, "p1", counters)];
         let path = write_session_file(temp.path(), "sess-reasoning", &lines);
 
-        let result = sync_single_grok_file(&db, &path)?;
+        let cursors = crate::services::session_usage::load_sync_cursors(&db)?;
+        let result = sync_single_grok_file(&db, &path, &cursors)?;
         assert_eq!(result.imported, 1);
 
         let conn = lock_conn!(db.conn);
@@ -802,7 +803,8 @@ mod tests {
         drop(conn);
 
         // 重扫幂等：UPSERT 不产生第二行，也不改变数值
-        let result = sync_single_grok_file(&db, &path)?;
+        let cursors = crate::services::session_usage::load_sync_cursors(&db)?;
+        let result = sync_single_grok_file(&db, &path, &cursors)?;
         assert_eq!(result.imported, 0);
         let conn = lock_conn!(db.conn);
         let count: i64 = conn.query_row(

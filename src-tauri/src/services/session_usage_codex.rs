@@ -3279,7 +3279,7 @@ mod tests {
             )?;
         }
         let source_path = source.to_string_lossy().to_string();
-        update_sync_state(&db, &source_path, 1, 3)?;
+        update_codex_sync_state(&db, &source_path, 1, 3, 3)?;
 
         assert_eq!(
             sync_test_file(&db, &archived_file, &[&archived_file])?.imported,
