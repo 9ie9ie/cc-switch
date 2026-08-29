@@ -173,6 +173,12 @@ pub async fn handle_streaming(
 
     let mut response_headers = response.headers().clone();
     strip_hop_by_hop_response_headers(&mut response_headers);
+    if !response_headers.contains_key(axum::http::header::CONTENT_TYPE) {
+        response_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("text/event-stream"),
+        );
+    }
 
     let mut builder = axum::response::Response::builder().status(status);
 
@@ -330,11 +336,30 @@ pub async fn process_response(
     parser_config: &UsageParserConfig,
     connection_guard: Option<ActiveConnectionGuard>,
 ) -> Result<Response, ProxyError> {
-    if is_sse_response(&response) {
+    process_response_with_stream_hint(response, ctx, state, parser_config, false, connection_guard)
+        .await
+}
+
+/// Process a response while honoring the client's `stream` request when an
+/// upstream omits the SSE Content-Type. An explicit JSON response still wins:
+/// some compatible gateways ignore `stream: true` and return a normal body.
+pub async fn process_response_with_stream_hint(
+    response: ProxyResponse,
+    ctx: &RequestContext,
+    state: &ProxyState,
+    parser_config: &UsageParserConfig,
+    stream_hint: bool,
+    connection_guard: Option<ActiveConnectionGuard>,
+) -> Result<Response, ProxyError> {
+    if should_process_as_streaming(&response, stream_hint) {
         Ok(handle_streaming(response, ctx, state, parser_config, connection_guard).await)
     } else {
         handle_non_streaming(response, ctx, state, parser_config, connection_guard).await
     }
+}
+
+fn should_process_as_streaming(response: &ProxyResponse, stream_hint: bool) -> bool {
+    is_sse_response(response) || (stream_hint && !response.is_json())
 }
 
 // ============================================================================
@@ -932,6 +957,52 @@ mod tests {
             Some("message_start")
         );
         assert_eq!(super::strip_sse_field("id:1", "data"), None);
+    }
+
+    #[test]
+    fn stream_hint_recovers_untyped_responses_sse_usage() {
+        let response = ProxyResponse::buffered(
+            http::StatusCode::OK,
+            HeaderMap::new(),
+            Bytes::from_static(b"data: omitted"),
+        );
+        assert!(should_process_as_streaming(&response, true));
+
+        let usage = TokenUsage::from_codex_stream_events_auto(&[serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_untyped",
+                "model": "gpt-5.6-terra",
+                "usage": {
+                    "input_tokens": 100,
+                    "input_tokens_details": {"cached_tokens": 40},
+                    "output_tokens": 25,
+                    "output_tokens_details": {"reasoning_tokens": 12}
+                }
+            }
+        })])
+        .expect("response.completed usage");
+
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 25);
+        assert_eq!(usage.reasoning_output_tokens, 12);
+        assert_eq!(usage.cache_read_tokens, 40);
+    }
+
+    #[test]
+    fn explicit_json_response_overrides_stream_hint() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        let response = ProxyResponse::buffered(
+            http::StatusCode::OK,
+            headers,
+            Bytes::from_static(br#"{"ok":true}"#),
+        );
+
+        assert!(!should_process_as_streaming(&response, true));
     }
 
     #[test]
