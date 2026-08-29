@@ -121,7 +121,7 @@ describe("RequestLogTable", () => {
     expect(formatTimingMs(milliseconds as number)).toBe(expected);
   });
 
-  it("shows Codex turn timing with its correct scope", () => {
+  it("does not show Codex turn or first-token timing", () => {
     useRequestLogsMock.mockReturnValue({
       data: {
         data: [
@@ -147,10 +147,41 @@ describe("RequestLogTable", () => {
       />,
     );
 
-    expect(
-      screen.getByText("usage.wholeTurn 1h 26m 48.6s"),
-    ).toBeInTheDocument();
-    expect(screen.getByText("usage.firstToken 8.2s")).toBeInTheDocument();
+    expect(screen.getByText("—")).toBeInTheDocument();
+    expect(screen.queryByText(/wholeTurn/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/firstToken/)).not.toBeInTheDocument();
+  });
+
+  it("shows only proxy latency even when first-token timing exists", () => {
+    useRequestLogsMock.mockReturnValue({
+      data: {
+        data: [
+          makeRequestLog({
+            providerId: "provider-1",
+            providerName: "Provider",
+            dataSource: "proxy",
+            latencyMs: 12_957,
+            firstTokenMs: 1_234,
+          }),
+        ],
+        total: 1,
+        page: 0,
+        pageSize: 20,
+      },
+      isLoading: false,
+    });
+
+    render(
+      <RequestLogTable
+        range={{ preset: "today" }}
+        rangeLabel="Today"
+        appType="codex"
+        refreshIntervalMs={0}
+      />,
+    );
+
+    expect(screen.getByText("13.0s")).toBeInTheDocument();
+    expect(screen.queryByText("1.2s")).not.toBeInTheDocument();
   });
 
   it("shows unavailable instead of zero for Codex request timing", () => {

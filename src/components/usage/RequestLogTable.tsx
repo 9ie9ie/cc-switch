@@ -322,44 +322,17 @@ export function RequestLogTable({
                           {CODEX_TURN_TIMING_SOURCES.has(
                             log.dataSource ?? "",
                           ) ? (
-                            log.durationMs != null ? (
-                              <div
-                                title={t(
-                                  "usage.codexTurnTimingHint",
-                                  "整轮耗时包含模型调用、命令执行和等待，不是单次模型请求耗时",
-                                )}
-                              >
-                                <div>
-                                  {t("usage.wholeTurn", "整轮")}{" "}
-                                  {formatTimingMs(log.durationMs)}
-                                </div>
-                                {log.firstTokenMs != null && (
-                                  <div className="text-muted-foreground">
-                                    {t("usage.firstToken", "首字")}{" "}
-                                    {formatTimingMs(log.firstTokenMs)}
-                                  </div>
-                                )}
-                              </div>
-                            ) : (
-                              <span
-                                className="text-muted-foreground"
-                                title={t(
-                                  "usage.requestTimingUnavailable",
-                                  "Codex 本地日志没有记录该次模型请求的用时",
-                                )}
-                              >
-                                —
-                              </span>
-                            )
-                          ) : (
-                            <>
-                              {formatTimingMs(log.latencyMs)}
-                              {log.firstTokenMs != null && (
-                                <span className="text-muted-foreground">
-                                  /{formatTimingMs(log.firstTokenMs)}
-                                </span>
+                            <span
+                              className="text-muted-foreground"
+                              title={t(
+                                "usage.requestTimingUnavailable",
+                                "Codex 本地日志没有记录该次模型请求的用时",
                               )}
-                            </>
+                            >
+                              —
+                            </span>
+                          ) : (
+                            formatTimingMs(log.latencyMs)
                           )}
                         </TableCell>
                         <TableCell className="text-center">

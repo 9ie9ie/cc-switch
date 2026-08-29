@@ -300,39 +300,18 @@ export function RequestDetailPanel({
               {t("usage.performance", "性能信息")}
             </h3>
             <dl className="grid grid-cols-2 gap-3 text-sm">
-              {["codex_session", "codex_sidebar"].includes(
-                request.dataSource ?? "",
-              ) ? (
-                <>
-                  <div>
-                    <dt className="text-muted-foreground">
-                      {t("usage.wholeTurnDuration", "整轮用时")}
-                    </dt>
-                    <dd className="font-mono">
-                      {request.durationMs != null
-                        ? formatTimingMs(request.durationMs)
-                        : "—"}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt className="text-muted-foreground">
-                      {t("usage.firstToken", "首字")}
-                    </dt>
-                    <dd className="font-mono">
-                      {request.firstTokenMs != null
-                        ? formatTimingMs(request.firstTokenMs)
-                        : "—"}
-                    </dd>
-                  </div>
-                </>
-              ) : (
-                <div>
-                  <dt className="text-muted-foreground">
-                    {t("usage.latency", "延迟")}
-                  </dt>
-                  <dd className="font-mono">{request.latencyMs}ms</dd>
-                </div>
-              )}
+              <div>
+                <dt className="text-muted-foreground">
+                  {t("usage.latency", "延迟")}
+                </dt>
+                <dd className="font-mono">
+                  {["codex_session", "codex_sidebar"].includes(
+                    request.dataSource ?? "",
+                  )
+                    ? "—"
+                    : formatTimingMs(request.latencyMs)}
+                </dd>
+              </div>
             </dl>
           </div>
 
