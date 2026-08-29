@@ -358,8 +358,11 @@ pub async fn process_response_with_stream_hint(
     }
 }
 
-fn should_process_as_streaming(response: &ProxyResponse, stream_hint: bool) -> bool {
-    is_sse_response(response) || (stream_hint && !response.is_json())
+pub(crate) fn should_process_as_streaming(response: &ProxyResponse, stream_hint: bool) -> bool {
+    let content_type_missing = response
+        .content_type()
+        .is_none_or(|content_type| content_type.trim().is_empty());
+    is_sse_response(response) || (stream_hint && content_type_missing)
 }
 
 // ============================================================================
@@ -1000,6 +1003,22 @@ mod tests {
             http::StatusCode::OK,
             headers,
             Bytes::from_static(br#"{"ok":true}"#),
+        );
+
+        assert!(!should_process_as_streaming(&response, true));
+    }
+
+    #[test]
+    fn explicit_non_sse_text_response_overrides_stream_hint() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("text/plain"),
+        );
+        let response = ProxyResponse::buffered(
+            http::StatusCode::OK,
+            headers,
+            Bytes::from_static(b"not an event stream"),
         );
 
         assert!(!should_process_as_streaming(&response, true));

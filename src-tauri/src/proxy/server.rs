@@ -418,6 +418,7 @@ mod tests {
     use super::*;
     use crate::provider::{Provider, ProviderMeta};
     use axum::http::{header, HeaderMap, StatusCode};
+    use rusqlite::OptionalExtension;
     use serde_json::{json, Value};
     use tokio::sync::Mutex;
 
@@ -624,5 +625,130 @@ mod tests {
             full_url_request.body["commands"]["search_query"][0]["q"],
             "full URL"
         );
+    }
+
+    #[tokio::test]
+    async fn untyped_responses_sse_records_usage_and_restores_content_type() {
+        let sse = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_untyped\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{",
+            "\"id\":\"resp_untyped\",\"model\":\"gpt-5.6-terra\",",
+            "\"usage\":{\"input_tokens\":100,",
+            "\"input_tokens_details\":{\"cached_tokens\":40},",
+            "\"output_tokens\":25,",
+            "\"output_tokens_details\":{\"reasoning_tokens\":12}}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mock_app = Router::new().route(
+            "/v1/responses",
+            post(move || async move {
+                axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .body(axum::body::Body::from(sse))
+                    .expect("build untyped SSE response")
+            }),
+        );
+        let mock_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind mock upstream");
+        let mock_addr = mock_listener.local_addr().expect("mock upstream address");
+        let mock_handle = tokio::spawn(async move {
+            axum::serve(mock_listener, mock_app)
+                .await
+                .expect("serve mock upstream");
+        });
+
+        let db = Arc::new(Database::memory().expect("memory database"));
+        let provider = Provider::with_id(
+            "untyped-sse-upstream".to_string(),
+            "Untyped SSE Upstream".to_string(),
+            json!({
+                "base_url": format!("http://{mock_addr}/v1"),
+                "auth": {"OPENAI_API_KEY": "upstream-secret"}
+            }),
+            None,
+        );
+        db.save_provider("codex", &provider)
+            .expect("save test provider");
+        db.set_current_provider("codex", &provider.id)
+            .expect("select test provider");
+
+        let proxy = ProxyServer::new(
+            ProxyConfig {
+                listen_port: 0,
+                enable_logging: true,
+                non_streaming_timeout: 10,
+                ..ProxyConfig::default()
+            },
+            db.clone(),
+            None,
+        );
+        let proxy_info = proxy.start().await.expect("start test proxy");
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{}/v1/responses", proxy_info.port))
+            .header(header::AUTHORIZATION, "Bearer client-secret")
+            .json(&json!({
+                "model": "gpt-5.6-terra",
+                "input": "ping",
+                "stream": true
+            }))
+            .send()
+            .await
+            .expect("send streaming request");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        assert!(response
+            .text()
+            .await
+            .expect("read proxy stream")
+            .contains("response.completed"));
+
+        let mut recorded = None;
+        for _ in 0..50 {
+            recorded = {
+                let conn = crate::database::lock_conn!(db.conn);
+                conn.query_row(
+                    "SELECT input_tokens, output_tokens, reasoning_output_tokens,
+                            cache_read_tokens, is_streaming, first_token_ms
+                       FROM proxy_request_logs
+                      WHERE provider_id = ?1 AND data_source = 'proxy'",
+                    [&provider.id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, Option<i64>>(5)?,
+                        ))
+                    },
+                )
+                .optional()
+                .expect("query usage log")
+            };
+            if recorded.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let recorded = recorded.expect("stream usage should be recorded");
+        assert_eq!(recorded.0, 100);
+        assert_eq!(recorded.1, 25);
+        assert_eq!(recorded.2, 12);
+        assert_eq!(recorded.3, 40);
+        assert_eq!(recorded.4, 1);
+        assert!(recorded.5.is_some());
+
+        proxy.stop().await.expect("stop test proxy");
+        mock_handle.abort();
     }
 }

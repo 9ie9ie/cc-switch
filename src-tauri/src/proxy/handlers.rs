@@ -36,7 +36,7 @@ use super::{
     },
     response_processor::{
         create_logged_passthrough_stream, create_usage_collector, process_response,
-        process_response_with_stream_hint, read_decoded_body,
+        process_response_with_stream_hint, read_decoded_body, should_process_as_streaming,
         strip_entity_headers_for_rebuilt_body, strip_hop_by_hop_response_headers,
         usage_logging_enabled, SseUsageCollector,
     },
@@ -947,6 +947,7 @@ async fn handle_responses_for_app(
             &ctx,
             &state,
             connection_guard,
+            is_stream,
             namespace_restore_map,
         )
         .await;
@@ -1167,6 +1168,7 @@ async fn handle_codex_responses_namespace_restore(
     ctx: &RequestContext,
     state: &ProxyState,
     connection_guard: Option<ActiveConnectionGuard>,
+    stream_hint: bool,
     restore_map: std::collections::HashMap<
         String,
         transform_codex_responses_namespace::NamespacedName,
@@ -1182,7 +1184,7 @@ async fn handle_codex_responses_namespace_restore(
             .await;
     }
 
-    if response.is_sse() {
+    if should_process_as_streaming(&response, stream_hint) {
         let mut response_headers = response.headers().clone();
         strip_hop_by_hop_response_headers(&mut response_headers);
 
