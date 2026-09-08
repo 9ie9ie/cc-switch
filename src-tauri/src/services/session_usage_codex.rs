@@ -446,6 +446,25 @@ fn thread_id_from_filename(path: &Path) -> Option<String> {
         .map(|value| value.hyphenated().to_string())
 }
 
+fn paginated_filename_matches(path: &Path, payload: &serde_json::Value, meta_id: &str) -> bool {
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let Some((prefix, segment)) = stem.rsplit_once('_') else {
+        return false;
+    };
+    payload
+        .get("history_mode")
+        .and_then(serde_json::Value::as_str)
+        == Some("paginated")
+        && payload
+            .pointer("/history_base/thread_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(meta_id)
+        && uuid::Uuid::parse_str(segment).is_ok()
+        && prefix.ends_with(&format!("-{meta_id}"))
+}
+
 fn explicit_parent_from_meta(payload: &serde_json::Value) -> ParentResolution {
     let forked_from = non_empty_string(payload.get("forked_from_id"));
     let spawned_from = payload
@@ -964,7 +983,9 @@ fn parse_codex_file(
                         .or_else(|| payload.get("threadId")),
                 );
                 if let (Some(filename_id), Some(meta_id)) = (&root_thread_id, meta_thread_id) {
-                    if filename_id != &meta_id {
+                    if filename_id != &meta_id
+                        && !paginated_filename_matches(file_path, payload, &meta_id)
+                    {
                         parent = ParentResolution::Deferred(format!(
                             "文件名线程 ID ({filename_id}) 与 root meta ID ({meta_id}) 不一致"
                         ));
@@ -1975,6 +1996,47 @@ mod tests {
             .collect::<Vec<_>>();
         let mut pass = CodexSyncPass::load(db)?;
         sync_single_codex_file(db, file, &build_rollout_index(&files), &mut pass)
+    }
+
+    #[test]
+    fn paginated_segments_keep_independent_usage_and_reject_unrelated_metadata(
+    ) -> Result<(), AppError> {
+        let dir = tempdir().unwrap();
+        let original = rollout_path(dir.path(), PARENT_ID);
+        let segment = rollout_path(dir.path(), &format!("{PARENT_ID}_{CHILD_A_ID}"));
+        write_jsonl(
+            &original,
+            &[
+                session_meta(PARENT_ID),
+                turn_context(),
+                token_count(100, 0, 10),
+            ],
+        );
+        let mut meta = session_meta(PARENT_ID);
+        meta["payload"]["history_mode"] = serde_json::json!("paginated");
+        meta["payload"]["history_base"] = serde_json::json!({"thread_id": PARENT_ID, "end_ordinal_exclusive": 10, "end_byte_offset": 1000});
+        write_jsonl(
+            &segment,
+            &[meta.clone(), turn_context(), token_count(200, 0, 20)],
+        );
+        let db = Database::memory()?;
+        let files = [&original as &Path, &segment as &Path];
+        assert!(!sync_test_file(&db, &original, &files)?.deferred);
+        assert!(!sync_test_file(&db, &segment, &files)?.deferred);
+        sync_test_file(&db, &segment, &files)?;
+        let conn = db.conn.lock().unwrap();
+        let totals: (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), SUM(input_tokens) FROM proxy_request_logs",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert_eq!(totals, (2, 300));
+        drop(conn);
+        meta["payload"]["history_base"]["thread_id"] = serde_json::json!(CHILD_B_ID);
+        write_jsonl(&segment, &[meta, turn_context(), token_count(200, 0, 20)]);
+        let parsed = parse_codex_file(&segment, thread_id_from_filename(&segment))?;
+        assert!(matches!(parsed.parent, ParentResolution::Deferred(_)));
+        Ok(())
     }
 
     #[test]
