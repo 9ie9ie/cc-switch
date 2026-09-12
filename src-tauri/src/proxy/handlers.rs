@@ -1211,6 +1211,11 @@ async fn handle_codex_xai_native_responses_rewrite(
     if should_process_as_streaming(&response, stream_hint) {
         let mut response_headers = response.headers().clone();
         strip_hop_by_hop_response_headers(&mut response_headers);
+        strip_entity_headers_for_rebuilt_body(&mut response_headers);
+        response_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("text/event-stream"),
+        );
 
         let mut builder = axum::response::Response::builder().status(status);
         for (key, value) in &response_headers {
