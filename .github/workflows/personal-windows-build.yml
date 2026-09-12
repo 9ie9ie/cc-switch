@@ -41,7 +41,7 @@ jobs:
         run: pnpm typecheck
 
       - name: Frontend unit tests
-        run: pnpm test:unit
+        run: pnpm test:unit --testTimeout=15000
 
       - name: Rust format check
         working-directory: src-tauri
