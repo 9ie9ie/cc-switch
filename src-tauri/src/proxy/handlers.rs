@@ -3294,10 +3294,12 @@ mod tests {
 
     #[test]
     fn rewritten_sse_responses_restore_missing_content_type() {
-        let response =
-            rewritten_sse_response_builder(StatusCode::OK, &axum::http::HeaderMap::new())
-                .body(axum::body::Body::empty())
-                .unwrap();
+        let response = rewritten_sse_response_builder(
+            axum::http::StatusCode::OK,
+            &axum::http::HeaderMap::new(),
+        )
+        .body(axum::body::Body::empty())
+        .unwrap();
         assert_eq!(
             response.headers()[axum::http::header::CONTENT_TYPE],
             "text/event-stream"

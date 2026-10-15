@@ -10,6 +10,28 @@ permissions:
   contents: read
 
 jobs:
+  frontend:
+    name: Frontend verification
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.12.3
+          run_install: false
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+      - name: TypeScript type check
+        run: pnpm typecheck
+      - name: Frontend unit tests
+        run: pnpm test:unit --testTimeout=15000 --maxWorkers=4 --minWorkers=1
+
   windows-x64:
     name: Windows x64 unsigned build
     runs-on: windows-2022
@@ -32,6 +54,7 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
+          cache-on-failure: true
           workspaces: |
             src-tauri -> target
             codex-bridge -> target
@@ -47,12 +70,6 @@ jobs:
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
-
-      - name: TypeScript type check
-        run: pnpm typecheck
-
-      - name: Frontend unit tests
-        run: pnpm test:unit --testTimeout=15000 --maxWorkers=4 --minWorkers=1
 
       - name: Rust format check
         working-directory: src-tauri
