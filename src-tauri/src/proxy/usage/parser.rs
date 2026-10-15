@@ -118,7 +118,7 @@ impl TokenUsage {
 }
 
 impl TokenUsage {
-    fn reasoning_output_tokens_from_usage(usage: &Value) -> u32 {
+    pub(crate) fn reasoning_output_tokens_from_usage(usage: &Value) -> u32 {
         usage
             .get("reasoning_output_tokens")
             .and_then(Value::as_u64)
