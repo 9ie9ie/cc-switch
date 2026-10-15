@@ -2227,6 +2227,21 @@ pub(crate) fn build_anthropic_usage_from_responses(usage: Option<&Value>) -> Val
         "output_tokens": output
     });
 
+    // Reasoning is an output subset, not additional billable output.
+    if let Some(reasoning) = [
+        "/reasoning_output_tokens",
+        "/reasoning_tokens",
+        "/reasoningTokens",
+        "/output_tokens_details/reasoning_tokens",
+        "/completion_tokens_details/reasoning_tokens",
+        "/output_tokens_details/thinking_tokens",
+    ]
+    .iter()
+    .find_map(|path| u.pointer(path).and_then(Value::as_u64))
+    {
+        result["reasoning_output_tokens"] = json!(reasoning);
+    }
+
     // Step 1: OpenAI nested details as fallback for cache tokens
     // OpenAI Responses API: input_tokens_details.cached_tokens
     if let Some(cached) = u
@@ -5483,6 +5498,108 @@ mod tests {
     }
 
     // ==================== Usage Field Robustness Tests ====================
+
+    #[test]
+    fn test_responses_reasoning_non_stream_preserves_usage_and_cost() {
+        use crate::proxy::usage::{CostCalculator, ModelPricing, TokenUsage};
+
+        let pricing = ModelPricing::from_strings("3", "15", "0.3", "3.75").unwrap();
+        for reasoning in [Some(516), Some(0), None] {
+            let mut response = json!({
+                "id": "resp_reasoning",
+                "model": "deepseek-v4-pro",
+                "status": "completed",
+                "output": [],
+                "usage": {
+                    "input_tokens": 1000,
+                    "output_tokens": 2000,
+                    "total_tokens": 3000,
+                    "input_tokens_details": {"cached_tokens": 100}
+                }
+            });
+            let baseline = responses_to_anthropic(response.clone()).unwrap();
+            let baseline_usage = TokenUsage::from_claude_response(&baseline).unwrap();
+            if let Some(reasoning) = reasoning {
+                response["usage"]["output_tokens_details"] = json!({"reasoning_tokens": reasoning});
+            }
+            let mut result = responses_to_anthropic(response).unwrap();
+            let usage = TokenUsage::from_claude_response(&result).unwrap();
+            assert_eq!(usage.reasoning_output_tokens, reasoning.unwrap_or(0));
+            assert_eq!(usage.output_tokens, 2000);
+            assert_eq!(
+                CostCalculator::calculate(&usage, &pricing, rust_decimal::Decimal::ONE).total_cost,
+                CostCalculator::calculate(&baseline_usage, &pricing, rust_decimal::Decimal::ONE)
+                    .total_cost
+            );
+            assert_eq!(
+                result["usage"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("reasoning_output_tokens"),
+                reasoning.map(|tokens| json!(tokens))
+            );
+            assert_eq!(result, baseline);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_responses_reasoning_stream_preserves_explicit_counts_only() {
+        use crate::proxy::providers::streaming_responses::create_anthropic_sse_stream_from_responses;
+        use crate::proxy::usage::TokenUsage;
+        use futures::StreamExt;
+
+        for reasoning in [Some(1034), Some(0), None] {
+            let mut usage =
+                json!({"input_tokens": 1000, "output_tokens": 2000, "total_tokens": 3000});
+            if let Some(reasoning) = reasoning {
+                usage["output_tokens_details"] = json!({"reasoning_tokens": reasoning});
+            }
+            let event = json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_reasoning",
+                    "model": "deepseek-v4-pro",
+                    "status": "completed",
+                    "output": [],
+                    "usage": usage
+                }
+            });
+            let input = futures::stream::iter(vec![Ok::<_, std::io::Error>(bytes::Bytes::from(
+                format!("event: response.completed\ndata: {event}\n\n"),
+            ))]);
+            let stream = create_anthropic_sse_stream_from_responses(input);
+            futures::pin_mut!(stream);
+            let mut output = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                output.extend_from_slice(&chunk.unwrap());
+            }
+            let text = String::from_utf8(output).unwrap();
+            let events: Vec<Value> = text
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .map(|data| serde_json::from_str(data).unwrap())
+                .collect();
+            let parsed = TokenUsage::from_claude_stream_events(&events).unwrap();
+            assert_eq!(parsed.reasoning_output_tokens, reasoning.unwrap_or(0));
+            assert_eq!((parsed.input_tokens, parsed.output_tokens), (1000, 2000));
+            let mut final_usage = events
+                .iter()
+                .find(|event| event["type"] == "message_delta")
+                .unwrap()["usage"]
+                .clone();
+            assert_eq!(
+                final_usage
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("reasoning_output_tokens"),
+                reasoning.map(|tokens| json!(tokens))
+            );
+            assert_eq!(
+                final_usage,
+                json!({"input_tokens": 1000, "output_tokens": 2000})
+            );
+        }
+    }
 
     #[test]
     fn test_build_usage_from_null_parameter() {

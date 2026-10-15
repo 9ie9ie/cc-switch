@@ -484,6 +484,9 @@ fn insert_sidebar_usage_on_conn(
     } else {
         event.model.trim()
     };
+    if let Some(updated) = enrich_recorded_sidebar_usage_on_conn(conn, event, &usage, model)? {
+        return Ok(updated);
+    }
     let dedup_key = DedupKey {
         app_type: "codex",
         model,
@@ -591,6 +594,80 @@ fn insert_sidebar_usage_on_conn(
         record_sidebar_usage_target_on_conn(conn, event, &event.event_id, "codex_sidebar")?;
     }
     Ok(inserted > 0)
+}
+
+// A repeated event is bound to its original target, even after detail pruning.
+// Never run fingerprint matching again for a late reasoning-only update.
+fn enrich_recorded_sidebar_usage_on_conn(
+    conn: &rusqlite::Connection,
+    event: &SidebarUsageEvent,
+    usage: &TokenUsage,
+    model: &str,
+) -> Result<Option<bool>, AppError> {
+    let mapping = conn
+        .query_row(
+            "SELECT target_request_id, target_data_source, thread_id, turn_id
+         FROM codex_sidebar_event_map WHERE event_id = ?1",
+            [&event.event_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let target = match mapping {
+        Some((_, _, thread_id, turn_id))
+            if thread_id != event.thread_id || turn_id != event.turn_id =>
+        {
+            return Ok(Some(false));
+        }
+        Some((Some(request_id), Some(data_source), _, _)) => (request_id, data_source),
+        Some((Some(_), None, _, _)) => return Ok(Some(false)),
+        _ => {
+            let Some(data_source) = request_data_source_on_conn(conn, &event.event_id)? else {
+                // A timing-only mapping does not mean the first usage was imported.
+                return Ok(None);
+            };
+            // Preserve identity for legacy detail rows that predate the event map.
+            conn.execute(
+                "INSERT INTO codex_sidebar_event_map (
+                    event_id, target_request_id, target_data_source, thread_id, turn_id
+                 ) VALUES (?1, ?1, ?2, ?3, ?4)
+                 ON CONFLICT(event_id) DO UPDATE SET
+                    target_request_id = excluded.target_request_id,
+                    target_data_source = excluded.target_data_source",
+                rusqlite::params![event.event_id, data_source, event.thread_id, event.turn_id],
+            )?;
+            (event.event_id.clone(), data_source)
+        }
+    };
+    let updated = conn.execute(
+        "UPDATE proxy_request_logs SET reasoning_output_tokens = ?2
+         WHERE request_id = ?1 AND app_type = 'codex'
+           AND COALESCE(data_source, 'proxy') = ?3
+           AND LOWER(model) = LOWER(?4)
+           AND input_tokens = ?5 AND output_tokens = ?6
+           AND cache_read_tokens = ?7 AND cache_creation_tokens = ?8
+           AND reasoning_output_tokens < ?2",
+        rusqlite::params![
+            target.0,
+            usage.reasoning_output_tokens,
+            target.1,
+            model,
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_read_tokens,
+            usage.cache_creation_tokens
+        ],
+    )?;
+    if updated > 0 {
+        crate::usage_events::notify_log_recorded();
+    }
+    Ok(Some(updated > 0))
 }
 
 fn request_data_source_on_conn(
@@ -749,6 +826,116 @@ mod tests {
             .open(path)
             .unwrap();
         writeln!(file, "{value}").unwrap();
+    }
+
+    #[test]
+    fn repeated_event_enriches_only_its_original_detail_or_proxy_target() -> Result<(), AppError> {
+        for mapped_proxy in [false, true] {
+            let db = Database::memory()?;
+            let conn = lock_conn!(db.conn);
+            let event_id = "codex_sidebar:usage-v1:thread-side:turn-side:1";
+            let target = if mapped_proxy {
+                "original-proxy"
+            } else {
+                event_id
+            };
+            if mapped_proxy {
+                conn.execute_batch(
+                    "INSERT INTO proxy_request_logs (
+                        request_id, provider_id, app_type, model, input_tokens, output_tokens,
+                        cache_read_tokens, cache_creation_tokens, latency_ms, status_code,
+                        created_at, data_source, total_cost_usd
+                     ) VALUES ('original-proxy', 'provider', 'codex', 'gpt-5.6-sol',
+                        1000, 80, 100, 5, 1250, 200, 1800000000, 'proxy', '0.125');",
+                )?;
+            }
+            let mut usage_event: SidebarUsageEvent =
+                serde_json::from_value(event(event_id, 1000, 80, 10)).unwrap();
+            let mut pricing = HashMap::new();
+            assert_eq!(
+                insert_sidebar_usage_on_conn(&conn, &usage_event, &mut pricing)?,
+                !mapped_proxy
+            );
+            if !mapped_proxy {
+                conn.execute(
+                    "DELETE FROM codex_sidebar_event_map WHERE event_id = ?1",
+                    [event_id],
+                )?;
+            }
+            conn.execute_batch(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model, input_tokens, output_tokens,
+                    cache_read_tokens, cache_creation_tokens, latency_ms, status_code,
+                    created_at, data_source, total_cost_usd
+                 ) VALUES ('other-proxy', 'provider', 'codex', 'gpt-5.6-sol',
+                    1000, 80, 100, 5, 1250, 200, 1800000000, 'proxy', '0.25');",
+            )?;
+            let snapshot = || -> Result<(i64, i64, i64, i64, String), AppError> {
+                Ok(conn.query_row(
+                    "SELECT input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                            total_cost_usd FROM proxy_request_logs WHERE request_id = ?1",
+                    [target],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )?)
+            };
+            let before = snapshot()?;
+            for (reasoning, changed) in [(30, true), (30, false), (5, false)] {
+                usage_event.usage.reasoning_output_tokens = reasoning;
+                assert_eq!(
+                    insert_sidebar_usage_on_conn(&conn, &usage_event, &mut pricing)?,
+                    changed
+                );
+                assert_eq!(snapshot()?, before);
+            }
+            usage_event.usage.reasoning_output_tokens = 60;
+            usage_event.usage.input_tokens += 1;
+            assert!(!insert_sidebar_usage_on_conn(
+                &conn,
+                &usage_event,
+                &mut pricing
+            )?);
+            usage_event.usage.input_tokens -= 1;
+            usage_event.model = "other-model".into();
+            assert!(!insert_sidebar_usage_on_conn(
+                &conn,
+                &usage_event,
+                &mut pricing
+            )?);
+            usage_event.model = "gpt-5.6-sol".into();
+            let rows: (i64, i64, i64) = conn.query_row(
+                "SELECT COUNT(*), MAX(CASE WHEN request_id = ?1 THEN reasoning_output_tokens END),
+                        MAX(CASE WHEN request_id = 'other-proxy' THEN reasoning_output_tokens END)
+                 FROM proxy_request_logs",
+                [target],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            assert_eq!(rows, (2, 30, 0));
+            assert_eq!(snapshot()?, before);
+            conn.execute(
+                "DELETE FROM proxy_request_logs WHERE request_id = ?1",
+                [target],
+            )?;
+            assert!(!insert_sidebar_usage_on_conn(
+                &conn,
+                &usage_event,
+                &mut pricing
+            )?);
+            let remaining: (i64, i64) = conn.query_row(
+                "SELECT COUNT(*), MAX(reasoning_output_tokens) FROM proxy_request_logs",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            assert_eq!(remaining, (1, 0));
+        }
+        Ok(())
     }
 
     #[test]

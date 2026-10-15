@@ -171,6 +171,7 @@ struct TurnInfo {
     model: String,
     sequence: u64,
     last_total: Option<UsageSignature>,
+    last_usage: Option<UsageRecord>,
     started_at: Instant,
     first_token_ms: Option<u64>,
     timing_emitted: bool,
@@ -182,7 +183,6 @@ struct UsageSignature {
     cached_input_tokens: u64,
     cache_write_input_tokens: u64,
     output_tokens: u64,
-    reasoning_output_tokens: u64,
     total_tokens: u64,
 }
 
@@ -218,7 +218,6 @@ impl UsageBreakdown {
             cached_input_tokens: self.cached_input_tokens,
             cache_write_input_tokens: self.cache_write_input_tokens,
             output_tokens: self.output_tokens,
-            reasoning_output_tokens: self.reasoning_output_tokens,
             total_tokens: self.total_tokens,
         }
     }
@@ -403,6 +402,7 @@ impl BridgeState {
                         model,
                         sequence: 0,
                         last_total: None,
+                        last_usage: None,
                         started_at,
                         first_token_ms: None,
                         timing_emitted: false,
@@ -477,6 +477,7 @@ impl BridgeState {
                 model,
                 sequence: 0,
                 last_total: None,
+                last_usage: None,
                 started_at: Instant::now(),
                 first_token_ms: None,
                 timing_emitted: false,
@@ -570,6 +571,14 @@ impl BridgeState {
 
         let signature = total.signature();
         if turn.last_total == Some(signature) {
+            // Reasoning is output metadata, not an additional sampling request.
+            let previous = turn.last_usage.as_mut()?;
+            if previous.usage.signature() == last.signature()
+                && last.reasoning_output_tokens > previous.usage.reasoning_output_tokens
+            {
+                previous.usage.reasoning_output_tokens = last.reasoning_output_tokens;
+                return Some(previous.clone());
+            }
             return None;
         }
         turn.last_total = Some(signature);
@@ -583,7 +592,7 @@ impl BridgeState {
             .and_then(nonnegative_u64)
             .and_then(|value| i64::try_from(value).ok())
             .unwrap_or_else(now_millis);
-        Some(UsageRecord {
+        let record = UsageRecord {
             schema_version: 1,
             event_id: format!("{EVENT_ID_PREFIX}{thread_id}:{turn_id}:{}", turn.sequence),
             thread_id: thread_id.to_owned(),
@@ -591,7 +600,9 @@ impl BridgeState {
             model: turn.model.clone(),
             completed_at_ms,
             usage: last,
-        })
+        };
+        turn.last_usage = Some(record.clone());
+        Some(record)
     }
 }
 
@@ -914,6 +925,33 @@ mod tests {
         }));
         start_turn(&mut state);
         assert!(state.observe_server_message(&usage(6000, 80, 40)).is_none());
+    }
+
+    #[test]
+    fn late_reasoning_reuses_event_identity_and_does_not_repeat_billable_usage() {
+        let mut state = BridgeState::default();
+        fork_side_thread(&mut state);
+        start_turn(&mut state);
+        let original = usage(6000, 80, 0);
+        let first = expect_usage(state.observe_server_message(&original).unwrap());
+
+        let mut late_total = original.clone();
+        late_total["params"]["tokenUsage"]["total"]["reasoningOutputTokens"] =
+            serde_json::json!(160);
+        assert!(state.observe_server_message(&late_total).is_none());
+
+        let mut late_last = usage(6000, 80, 40);
+        late_last["emittedAtMs"] = serde_json::json!(1_800_000_100_000i64);
+        let enriched = expect_usage(state.observe_server_message(&late_last).unwrap());
+        assert_eq!(enriched.event_id, first.event_id);
+        assert_eq!(enriched.completed_at_ms, first.completed_at_ms);
+        assert_eq!(enriched.usage.input_tokens, first.usage.input_tokens);
+        assert_eq!(enriched.usage.output_tokens, first.usage.output_tokens);
+        assert_eq!(enriched.usage.reasoning_output_tokens, 40);
+        assert!(state.observe_server_message(&late_last).is_none());
+        assert!(state.observe_server_message(&original).is_none());
+        let next = expect_usage(state.observe_server_message(&usage(7000, 90, 45)).unwrap());
+        assert_eq!(next.event_id, "codex_sidebar:usage-v1:side:turn-1:2");
     }
 
     #[test]
