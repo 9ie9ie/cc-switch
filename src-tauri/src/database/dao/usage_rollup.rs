@@ -361,7 +361,7 @@ mod tests {
                     input_token_semantics, total_cost_usd,
                     latency_ms, status_code, created_at
                 ) VALUES ('total-semantics-rollup', 'p1', 'codex', 'gpt-5.5',
-                          100, 5, 516, 10, 20, 1, '0.10', 100, 200, ?1)",
+                          100, 800, 516, 10, 20, 1, '0.10', 100, 200, ?1)",
                 [old_ts],
             )?;
         }
@@ -386,6 +386,13 @@ mod tests {
             },
         )?;
         assert_eq!(row, (70, 516, 10, 20, 2));
+        let (output, cost): (i64, f64) = conn.query_row(
+            "SELECT output_tokens, CAST(total_cost_usd AS REAL)
+             FROM usage_daily_rollups WHERE model = 'gpt-5.5'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!((output, cost), (800, 0.10));
 
         Ok(())
     }

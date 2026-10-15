@@ -104,6 +104,7 @@ impl SidebarUsageEvent {
             reasoning_output_tokens,
             cache_read_tokens,
             cache_creation_tokens,
+            cache_creation_1h_tokens: 0,
             model: Some(self.model.clone()),
             message_id: None,
         })
@@ -438,6 +439,7 @@ fn apply_stored_sidebar_timing_on_conn(
                     duration_ms = ?2
               WHERE request_id = ?1
                 AND data_source IN ('codex_session', 'codex_sidebar')
+                AND (data_source = 'codex_sidebar' OR latency_ms = 0)
                 AND (
                     latency_ms != 0
                     OR first_token_ms IS NOT ?3
@@ -634,7 +636,8 @@ fn merge_reasoning_into_matching_codex_session(
                 AND output_tokens = ?4
                 AND (reasoning_output_tokens = ?5 OR reasoning_output_tokens = 0 OR ?5 = 0)
                 AND cache_read_tokens = ?6
-                AND (cache_creation_tokens = ?7 OR cache_creation_tokens = 0)
+                AND (cache_creation_tokens = ?7
+                     OR (cache_creation_tokens = 0 AND input_token_semantics = 0))
                 AND created_at BETWEEN ?8 - ?9 AND ?8 + ?9
                 AND (
                     LOWER(model) = LOWER(?2)
@@ -677,17 +680,21 @@ fn merge_reasoning_into_matching_codex_session(
         return Ok(None);
     };
     if usage.reasoning_output_tokens > existing_reasoning {
-        conn.execute(
-            "UPDATE proxy_request_logs
+        let updated = conn
+            .execute(
+                "UPDATE proxy_request_logs
                 SET reasoning_output_tokens = ?2
               WHERE request_id = ?1 AND reasoning_output_tokens < ?2",
-            rusqlite::params![request_id, usage.reasoning_output_tokens as i64],
-        )
-        .map_err(|error| {
-            AppError::Database(format!(
-                "complete matching Codex session reasoning tokens failed: {error}"
-            ))
-        })?;
+                rusqlite::params![request_id, usage.reasoning_output_tokens as i64],
+            )
+            .map_err(|error| {
+                AppError::Database(format!(
+                    "complete matching Codex session reasoning tokens failed: {error}"
+                ))
+            })?;
+        if updated > 0 {
+            crate::usage_events::notify_log_recorded();
+        }
     }
     Ok(Some(request_id))
 }
@@ -929,6 +936,48 @@ mod tests {
     }
 
     #[test]
+    fn modern_rollout_cache_counts_are_exact_and_request_timing_is_preserved(
+    ) -> Result<(), AppError> {
+        for cache_write in [0, 5] {
+            let db = Database::memory()?;
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("sidebar.jsonl");
+            let event_id = "codex_sidebar:usage-v1:thread-side:turn-side:1";
+            {
+                let conn = lock_conn!(db.conn);
+                conn.execute(
+                    "INSERT INTO proxy_request_logs (
+                        request_id, provider_id, app_type, model, input_tokens, output_tokens,
+                        reasoning_output_tokens, cache_read_tokens, cache_creation_tokens,
+                        input_token_semantics, latency_ms, first_token_ms, status_code,
+                        session_id, created_at, data_source
+                     ) VALUES ('rollout', '_codex_session', 'codex', 'gpt-5.6-sol',
+                        1200, 90, 0, 100, ?1, ?2, 1250, 300, 200,
+                        'thread-side', 1800000000, 'codex_session')",
+                    rusqlite::params![cache_write, INPUT_TOKEN_SEMANTICS_TOTAL],
+                )?;
+            }
+            append_value(&path, &event(event_id, 1200, 90, 50));
+            let result = sync_codex_sidebar_usage_file(&db, &path)?;
+            assert_eq!(result.imported, u32::from(cache_write == 0));
+            append_value(&path, &timing_event(event_id, 4200, 700));
+            sync_codex_sidebar_usage_file(&db, &path)?;
+            let conn = lock_conn!(db.conn);
+            let timing: (i64, i64, Option<i64>, i64) = conn.query_row(
+                "SELECT latency_ms, first_token_ms, duration_ms, reasoning_output_tokens
+                 FROM proxy_request_logs WHERE request_id = 'rollout'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+            assert_eq!(
+                timing,
+                (1250, 300, None, if cache_write == 5 { 50 } else { 0 })
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn skips_zero_and_incomplete_events_without_estimation() -> Result<(), AppError> {
         let dir = tempdir().unwrap();
         let path = dir.path().join("sidebar.jsonl");
@@ -962,7 +1011,7 @@ mod tests {
                 "codex_sidebar:usage-v1:thread-side:turn-side:1",
                 1000,
                 80,
-                516,
+                40,
             ),
         );
         let db = Database::memory()?;
@@ -988,7 +1037,7 @@ mod tests {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        assert_eq!(row, (1, 516));
+        assert_eq!(row, (1, 40));
         Ok(())
     }
 
@@ -1002,7 +1051,7 @@ mod tests {
                 "codex_sidebar:usage-v1:thread-side:turn-side:1",
                 1000,
                 80,
-                516,
+                40,
             ),
         );
         let db = Database::memory()?;
@@ -1032,7 +1081,7 @@ mod tests {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        assert_eq!(row, (1, 0, 516));
+        assert_eq!(row, (1, 0, 40));
         Ok(())
     }
 }
