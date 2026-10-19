@@ -1024,6 +1024,34 @@ mod tests {
     }
 
     #[test]
+    fn output_after_unobserved_usage_and_replay_cannot_time_the_next_sample() {
+        let mut state = BridgeState::default();
+        fork_side_thread(&mut state);
+        start_turn(&mut state);
+        let first = expect_usage(state.observe_server_message(&usage(6000, 800, 0)).unwrap());
+        state.turns.get_mut("turn-1").unwrap().started_at =
+            Instant::now() - std::time::Duration::from_secs(10);
+        state.observe_server_message(&serde_json::json!({
+            "method": "item/agentMessage/delta",
+            "params": {"threadId": "side", "turnId": "turn-1", "itemId": "late-m1", "delta": "late output"}
+        }));
+        let replay = expect_usage(
+            state
+                .observe_server_message(&usage(6000, 800, 516))
+                .unwrap(),
+        );
+        assert_eq!(replay.event_id, first.event_id);
+        assert_eq!(replay.estimated_latency_ms, None);
+        let next = expect_usage(
+            state
+                .observe_server_message(&usage(12000, 700, 100))
+                .unwrap(),
+        );
+        assert_ne!(next.event_id, first.event_id);
+        assert_eq!(next.estimated_latency_ms, None);
+    }
+
+    #[test]
     fn late_reasoning_reuses_event_identity_and_does_not_repeat_billable_usage() {
         let mut state = BridgeState::default();
         fork_side_thread(&mut state);

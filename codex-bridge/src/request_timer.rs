@@ -73,6 +73,7 @@ impl RequestTimer {
                             self.ambiguous = true;
                         }
                     }
+                    self.retired_items.insert(id.to_owned());
                     self.tool_completed_ms = Some(at_ms);
                     if self.tools.is_empty() {
                         self.boundary_ms = Some(at_ms);
@@ -119,13 +120,25 @@ impl RequestTimer {
         } else {
             None
         };
+        let next_boundary = if self.ambiguous
+            || !self.tools.is_empty()
+            || self.last_output_ms.is_none_or(|last| last > at_ms)
+        {
+            // Without observed output, late items may still belong to this sample.
+            None
+        } else if self.saw_tool {
+            // Usage delivery may lag behind the tool result and the next request.
+            self.tool_completed_ms
+        } else {
+            Some(at_ms)
+        };
         self.retired_items.extend(self.model_items.drain());
         self.start_ms = None;
         self.last_output_ms = None;
         self.tool_completed_ms = None;
         self.saw_tool = false;
         self.ambiguous = false;
-        self.boundary_ms = self.tools.is_empty().then_some(at_ms);
+        self.boundary_ms = next_boundary;
         result
     }
 }
@@ -160,11 +173,11 @@ mod tests {
     #[test]
     fn usage_delayed_until_after_tool_completion_uses_model_end() {
         let mut timer = RequestTimer::default();
-        timer.item("dynamicToolCall", "t1", false, 5_000);
-        timer.item("dynamicToolCall", "t1", true, 55_000);
-        assert_eq!(timer.finish(55_010), Some(5_000));
-        timer.model_output("m2", 58_000);
-        assert_eq!(timer.finish(60_010), Some(5_000));
+        timer.item("dynamicToolCall", "t1", false, 1_000);
+        timer.item("dynamicToolCall", "t1", true, 10_000);
+        assert_eq!(timer.finish(20_000), Some(1_000));
+        timer.model_output("m2", 21_000);
+        assert_eq!(timer.finish(22_000), Some(12_000));
     }
 
     #[test]
@@ -188,6 +201,27 @@ mod tests {
         timer.item("agentMessage", "m1", true, 3_010);
         timer.model_output("m1", 3_020);
         assert_eq!(timer.finish(20_000), None);
+    }
+
+    #[test]
+    fn output_after_an_unobserved_sample_does_not_prove_a_new_request() {
+        let mut timer = RequestTimer::default();
+        assert_eq!(timer.finish(1_000), None);
+        timer.model_output("late-m1", 2_000);
+        assert_eq!(timer.finish(10_000), None);
+        timer.model_output("m3", 11_000);
+        assert_eq!(timer.finish(12_000), Some(2_000));
+    }
+
+    #[test]
+    fn repeated_tool_completion_before_usage_is_idempotent() {
+        let mut timer = RequestTimer::default();
+        timer.item("commandExecution", "t1", false, 1_000);
+        timer.item("commandExecution", "t1", true, 10_000);
+        timer.item("commandExecution", "t1", true, 10_001);
+        assert_eq!(timer.finish(11_000), Some(1_000));
+        timer.model_output("m2", 12_000);
+        assert_eq!(timer.finish(13_000), Some(3_000));
     }
 
     #[test]
