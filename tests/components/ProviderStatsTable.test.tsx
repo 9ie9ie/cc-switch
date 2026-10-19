@@ -90,6 +90,53 @@ describe("ProviderStatsTable", () => {
     expect(speedCell(rows[1])).not.toHaveTextContent("≈");
   });
 
+  it.each([10_000, 0, undefined])(
+    "uses sidebar estSpeed totals with duration %s instead of average latency or total tokens",
+    (estSpeedDurationMs) => {
+      useProviderStatsMock.mockReturnValue({
+        isLoading: false,
+        data: [
+          stat({
+            providerId: "sidebar",
+            providerName: "Codex (Sidebar)",
+            appType: "codex",
+            totalTokens: 1_000_000,
+            avgLatencyMs: 5_208_631,
+            speedOutputTokens: 0,
+            speedGenerationMs: 0,
+            estSpeedOutputTokens: 1_000,
+            estSpeedDurationMs,
+            firstTokenMedianMs: 4_000,
+            estFirstTokenMedianMs: 6_000,
+          }),
+        ],
+      });
+
+      render(
+        <ProviderStatsTable
+          range={{ preset: "7d" }}
+          appType="codex"
+          refreshIntervalMs={0}
+        />,
+      );
+
+      const row = screen
+        .getByText("usage.sidebarProvider.label")
+        .closest("tr")!;
+      expect(speedCell(row)).toHaveTextContent(
+        estSpeedDurationMs ? /^≈100tok\/s$/ : /^—$/,
+      );
+      expect(row.children).toHaveLength(6);
+      expect(screen.getAllByRole("columnheader")).toHaveLength(6);
+      expect(
+        screen.queryByRole("columnheader", {
+          name: /latency|firstToken|duration|whole.?turn/i,
+        }),
+      ).not.toBeInTheDocument();
+      expect(screen.queryByText(/4\.0s|6\.0s|1h 26m/)).not.toBeInTheDocument();
+    },
+  );
+
   it("sorts by requests and replaces average latency with speed", () => {
     useProviderStatsMock.mockReturnValue({
       isLoading: false,

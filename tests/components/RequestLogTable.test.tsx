@@ -289,6 +289,67 @@ describe("RequestLogTable", () => {
     expect(onOpenDetail).toHaveBeenCalledWith("short");
   });
 
+  it.each([undefined, 4_000])(
+    "shows sidebar approximate speed and reasoning warnings without exposing firstTokenMs %s or turn timing",
+    (firstTokenMs) => {
+      const { container } = renderLog(
+        makeLog({
+          appType: "codex",
+          providerName: "Codex (Sidebar)",
+          dataSource: "codex_sidebar",
+          outputTokens: 1_000,
+          reasoningOutputTokens: 516,
+          latencyMs: 10_000,
+          firstTokenMs,
+          durationMs: 5_208_631,
+        }),
+      );
+
+      const row = screen.getAllByRole("row")[1];
+      expect(row.children).toHaveLength(10);
+      expect(row.children[8]).toHaveTextContent(/^≈100tok\/s$/);
+      expect(row.lastElementChild).toHaveTextContent(/^—$/);
+      expect(screen.getByTitle("usage.reasoningOutputTokens")).toHaveClass(
+        "text-danger-text",
+      );
+      expect(
+        screen.getByTitle("usage.reasoningOutputTokens"),
+      ).toHaveTextContent("516");
+      expect(screen.getAllByRole("columnheader")).toHaveLength(10);
+      expect(
+        screen.queryByText(
+          /10\.0s|4\.0s|1h 26m|firstToken|duration|whole.?turn/i,
+        ),
+      ).not.toBeInTheDocument();
+      expect(
+        container.querySelector(
+          '[title*="10.0s"], [title*="4.0s"], [title*="1h 26m"], [title*="timingTip"]',
+        ),
+      ).toBeNull();
+    },
+  );
+
+  it("does not use a long sidebar duration as a speed estimate when latency is zero", () => {
+    renderLog(
+      makeLog({
+        appType: "codex",
+        dataSource: "codex_sidebar",
+        outputTokens: 1_000,
+        latencyMs: 0,
+        firstTokenMs: undefined,
+        durationMs: 5_208_631,
+      }),
+    );
+
+    const row = screen.getAllByRole("row")[1];
+    expect(row.children[8]).toHaveTextContent(/^—$/);
+    expect(row.lastElementChild).toHaveTextContent(/^—$/);
+    expect(screen.queryByText(/tok\/s/)).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/0\.0s|1h 26m|firstToken|duration|whole.?turn/i),
+    ).not.toBeInTheDocument();
+  });
+
   it.each([516, 1034, 1552, 2588, 517_999_998])(
     "highlights %i reasoning tokens for a non-GPT model without a cap",
     (reasoningOutputTokens) => {
@@ -367,9 +428,12 @@ describe("RequestLogTable", () => {
   });
 
   it.each([undefined, "", "proxy"])(
-    "keeps ordinary proxy latency for source %s",
+    "keeps measured proxy speed and ordinary latency for source %s",
     (dataSource) => {
       renderLog(makeLog({ dataSource }));
+      expect(screen.getAllByRole("row")[1].children[8]).toHaveTextContent(
+        /^418tok\/s$/,
+      );
       expect(screen.getAllByRole("row")[1].lastElementChild).toHaveTextContent(
         /^13\.0s$/,
       );

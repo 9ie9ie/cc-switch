@@ -45,6 +45,8 @@ struct SidebarUsageEvent {
     turn_id: String,
     model: String,
     completed_at_ms: i64,
+    #[serde(default)]
+    estimated_latency_ms: Option<u64>,
     usage: SidebarTokenUsage,
 }
 
@@ -86,7 +88,17 @@ impl SidebarUsageEvent {
         if self.thread_id.trim().is_empty() || self.turn_id.trim().is_empty() {
             return Err("threadId and turnId are required".to_string());
         }
+        self.request_latency_ms()?;
         Ok(())
+    }
+
+    fn request_latency_ms(&self) -> Result<Option<i64>, String> {
+        match self.estimated_latency_ms {
+            Some(value) if value == 0 || value > i64::MAX as u64 => {
+                Err("estimatedLatencyMs must be positive and not exceed i64::MAX".to_string())
+            }
+            value => Ok(value.map(|value| value as i64)),
+        }
     }
 
     fn token_usage(&self) -> Result<TokenUsage, String> {
@@ -434,15 +446,14 @@ fn apply_stored_sidebar_timing_on_conn(
     let updated = conn
         .prepare_cached(
             "UPDATE proxy_request_logs
-                SET latency_ms = 0,
-                    first_token_ms = ?3,
+                SET first_token_ms = ?3,
                     duration_ms = ?2
               WHERE request_id = ?1
+                AND data_source = ?4
                 AND data_source IN ('codex_session', 'codex_sidebar')
                 AND (data_source = 'codex_sidebar' OR latency_ms = 0)
                 AND (
-                    latency_ms != 0
-                    OR first_token_ms IS NOT ?3
+                    first_token_ms IS NOT ?3
                     OR duration_ms IS NOT ?2
                 )",
         )
@@ -450,7 +461,8 @@ fn apply_stored_sidebar_timing_on_conn(
             statement.execute(rusqlite::params![
                 target_request_id,
                 duration_ms,
-                first_token_ms
+                first_token_ms,
+                target_data_source
             ])
         })
         .map_err(|error| {
@@ -466,6 +478,9 @@ fn insert_sidebar_usage_on_conn(
 ) -> Result<bool, AppError> {
     let usage = event
         .token_usage()
+        .map_err(|error| AppError::Config(format!("invalid sidebar usage: {error}")))?;
+    let latency_ms = event
+        .request_latency_ms()
         .map_err(|error| AppError::Config(format!("invalid sidebar usage: {error}")))?;
     if !usage.has_billable_tokens() {
         return Ok(false);
@@ -484,7 +499,9 @@ fn insert_sidebar_usage_on_conn(
     } else {
         event.model.trim()
     };
-    if let Some(updated) = enrich_recorded_sidebar_usage_on_conn(conn, event, &usage, model)? {
+    if let Some(updated) =
+        enrich_recorded_sidebar_usage_on_conn(conn, event, &usage, model, latency_ms)?
+    {
         return Ok(updated);
     }
     let dedup_key = DedupKey {
@@ -575,7 +592,7 @@ fn insert_sidebar_usage_on_conn(
                 cache_read_cost,
                 cache_creation_cost,
                 total_cost,
-                0i64,
+                latency_ms.unwrap_or(0),
                 Option::<i64>::None,
                 200i64,
                 Option::<String>::None,
@@ -597,12 +614,13 @@ fn insert_sidebar_usage_on_conn(
 }
 
 // A repeated event is bound to its original target, even after detail pruning.
-// Never run fingerprint matching again for a late reasoning-only update.
+// Never run fingerprint matching again for late reasoning or request timing.
 fn enrich_recorded_sidebar_usage_on_conn(
     conn: &rusqlite::Connection,
     event: &SidebarUsageEvent,
     usage: &TokenUsage,
     model: &str,
+    latency_ms: Option<i64>,
 ) -> Result<Option<bool>, AppError> {
     let mapping = conn
         .query_row(
@@ -645,7 +663,7 @@ fn enrich_recorded_sidebar_usage_on_conn(
             (event.event_id.clone(), data_source)
         }
     };
-    let updated = conn.execute(
+    let mut updated = conn.execute(
         "UPDATE proxy_request_logs SET reasoning_output_tokens = ?2
          WHERE request_id = ?1 AND app_type = 'codex'
            AND COALESCE(data_source, 'proxy') = ?3
@@ -664,6 +682,25 @@ fn enrich_recorded_sidebar_usage_on_conn(
             usage.cache_creation_tokens
         ],
     )?;
+    if let Some(latency_ms) = latency_ms.filter(|_| target.1 == "codex_sidebar") {
+        updated += conn.execute(
+            "UPDATE proxy_request_logs SET latency_ms = ?2
+             WHERE request_id = ?1 AND app_type = 'codex' AND data_source = 'codex_sidebar'
+               AND LOWER(model) = LOWER(?3)
+               AND input_tokens = ?4 AND output_tokens = ?5
+               AND cache_read_tokens = ?6 AND cache_creation_tokens = ?7
+               AND latency_ms != ?2",
+            rusqlite::params![
+                target.0,
+                latency_ms,
+                model,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_tokens,
+                usage.cache_creation_tokens
+            ],
+        )?;
+    }
     if updated > 0 {
         crate::usage_events::notify_log_recorded();
     }
@@ -828,25 +865,228 @@ mod tests {
         writeln!(file, "{value}").unwrap();
     }
 
+    fn with_estimate(mut value: serde_json::Value, latency_ms: u64) -> serde_json::Value {
+        value["estimatedLatencyMs"] = serde_json::json!(latency_ms);
+        value
+    }
+
+    fn billing_snapshot(
+        conn: &rusqlite::Connection,
+    ) -> Result<Vec<(String, [i64; 5], [String; 5])>, AppError> {
+        Ok(conn
+            .prepare(
+                "SELECT request_id, input_tokens, output_tokens, cache_read_tokens,
+                        cache_creation_tokens, input_token_semantics, input_cost_usd,
+                        output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd,
+                        total_cost_usd FROM proxy_request_logs ORDER BY request_id",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    [
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ],
+                    [
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                    ],
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
     #[test]
-    fn repeated_event_enriches_only_its_original_detail_or_proxy_target() -> Result<(), AppError> {
-        for mapped_proxy in [false, true] {
+    fn request_estimate_is_optional_and_requires_a_positive_i64() {
+        let value = event(
+            "codex_sidebar:usage-v1:thread-side:turn-side:1",
+            1000,
+            80,
+            40,
+        );
+        let missing: SidebarUsageEvent = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(missing.request_latency_ms().unwrap(), None);
+        assert!(missing.validate().is_ok());
+
+        let mut null = value.clone();
+        null["estimatedLatencyMs"] = serde_json::Value::Null;
+        let null: SidebarUsageEvent = serde_json::from_value(null).unwrap();
+        assert_eq!(null.request_latency_ms().unwrap(), None);
+
+        for estimate in [1, 1250, i64::MAX as u64] {
+            let parsed: SidebarUsageEvent =
+                serde_json::from_value(with_estimate(value.clone(), estimate)).unwrap();
+            assert!(parsed.validate().is_ok());
+            assert_eq!(parsed.request_latency_ms().unwrap(), Some(estimate as i64));
+        }
+        for estimate in [0, i64::MAX as u64 + 1, u64::MAX] {
+            let parsed: SidebarUsageEvent =
+                serde_json::from_value(with_estimate(value.clone(), estimate)).unwrap();
+            assert!(parsed.validate().is_err());
+            assert!(parsed.request_latency_ms().is_err());
+        }
+        for invalid in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("1250"),
+        ] {
+            let mut invalid_event = value.clone();
+            invalid_event["estimatedLatencyMs"] = invalid;
+            assert!(serde_json::from_value::<SidebarSpoolEvent>(invalid_event).is_err());
+        }
+    }
+
+    #[test]
+    fn request_estimates_preserve_billing_and_do_not_come_from_turn_timing() -> Result<(), AppError>
+    {
+        let event_id = "codex_sidebar:usage-v1:thread-side:turn-side:1";
+        let mut baseline = None;
+        for timing_first in [false, true] {
+            for estimate in [None, Some(1), Some(1250), Some(i64::MAX as u64)] {
+                let db = Database::memory()?;
+                let conn = lock_conn!(db.conn);
+                let mut value = event(event_id, 1000, 80, 40);
+                if let Some(estimate) = estimate {
+                    value = with_estimate(value, estimate);
+                }
+                let usage_event: SidebarUsageEvent = serde_json::from_value(value).unwrap();
+                let timing: SidebarTimingEvent =
+                    serde_json::from_value(timing_event(event_id, 4200, 700)).unwrap();
+                let mut pricing = HashMap::from([(
+                    "gpt-5.6-sol".to_string(),
+                    Some(ModelPricing::from_strings("2", "10", "1", "4").unwrap()),
+                )]);
+                if timing_first {
+                    assert!(apply_sidebar_timing_on_conn(&conn, &timing)?);
+                }
+                assert!(insert_sidebar_usage_on_conn(
+                    &conn,
+                    &usage_event,
+                    &mut pricing
+                )?);
+                if !timing_first {
+                    assert!(apply_sidebar_timing_on_conn(&conn, &timing)?);
+                }
+                assert!(!apply_sidebar_timing_on_conn(&conn, &timing)?);
+                assert!(!insert_sidebar_usage_on_conn(
+                    &conn,
+                    &usage_event,
+                    &mut pricing
+                )?);
+                let row: (i64, Option<i64>, Option<i64>, i64) = conn.query_row(
+                    "SELECT latency_ms, first_token_ms, duration_ms, reasoning_output_tokens
+                     FROM proxy_request_logs WHERE request_id = ?1",
+                    [event_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )?;
+                assert_eq!(
+                    row,
+                    (estimate.unwrap_or(0) as i64, Some(700), Some(4200), 40)
+                );
+                let snapshot = billing_snapshot(&conn)?;
+                assert_eq!(snapshot.len(), 1);
+                assert_eq!(
+                    snapshot[0].1,
+                    [1000, 80, 100, 5, INPUT_TOKEN_SEMANTICS_TOTAL]
+                );
+                assert_ne!(snapshot[0].2[4], "0");
+                assert_eq!(&snapshot, baseline.get_or_insert_with(|| snapshot.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn late_same_event_estimate_enriches_once_without_replaying_history() -> Result<(), AppError> {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sidebar.jsonl");
+        let event_id = "codex_sidebar:usage-v1:thread-side:turn-side:1";
+        let db = Database::memory()?;
+        append_value(&path, &event(event_id, 1000, 80, 10));
+        assert_eq!(sync_codex_sidebar_usage_file(&db, &path)?.imported, 1);
+        append_value(&path, &timing_event(event_id, 4200, 700));
+        assert_eq!(sync_codex_sidebar_usage_file(&db, &path)?.imported, 1);
+        let before = billing_snapshot(&lock_conn!(db.conn))?;
+        let mut offset = get_sync_state(&db, &path.to_string_lossy())?.1;
+        for (estimate, reasoning, imported) in [
+            (Some(1250), 10, 1),
+            (Some(1250), 10, 0),
+            (None, 40, 1),
+            (None, 10, 0),
+        ] {
+            let mut value = event(event_id, 1000, 80, reasoning);
+            if let Some(estimate) = estimate {
+                value = with_estimate(value, estimate);
+            }
+            append_value(&path, &value);
+            let result = sync_codex_sidebar_usage_file(&db, &path)?;
+            assert!(result.errors.is_empty(), "{:?}", result.errors);
+            assert_eq!(result.imported, imported);
+            let next_offset = get_sync_state(&db, &path.to_string_lossy())?.1;
+            assert!(next_offset > offset);
+            assert_eq!(next_offset, fs::metadata(&path).unwrap().len() as i64);
+            offset = next_offset;
+            let conn = lock_conn!(db.conn);
+            assert_eq!(billing_snapshot(&conn)?, before);
+            let timing: (i64, i64, i64) = conn.query_row(
+                "SELECT latency_ms, first_token_ms, duration_ms FROM proxy_request_logs
+                 WHERE request_id = ?1",
+                [event_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            assert_eq!(timing, (1250, 700, 4200));
+        }
+        assert_eq!(sync_codex_sidebar_usage_file(&db, &path)?.imported, 0);
+        let conn = lock_conn!(db.conn);
+        let reasoning: i64 = conn.query_row(
+            "SELECT reasoning_output_tokens FROM proxy_request_logs WHERE request_id = ?1",
+            [event_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(reasoning, 40);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_event_enriches_only_its_original_mapped_target() -> Result<(), AppError> {
+        for (data_source, original_latency) in [
+            ("codex_sidebar", 0),
+            ("proxy", 1250),
+            ("proxy", 0),
+            ("codex_session", 1250),
+            ("codex_session", 0),
+        ] {
             let db = Database::memory()?;
             let conn = lock_conn!(db.conn);
             let event_id = "codex_sidebar:usage-v1:thread-side:turn-side:1";
-            let target = if mapped_proxy {
-                "original-proxy"
-            } else {
+            let is_sidebar = data_source == "codex_sidebar";
+            let target = if is_sidebar {
                 event_id
+            } else {
+                "original-target"
             };
-            if mapped_proxy {
-                conn.execute_batch(
+            if !is_sidebar {
+                conn.execute(
                     "INSERT INTO proxy_request_logs (
                         request_id, provider_id, app_type, model, input_tokens, output_tokens,
-                        cache_read_tokens, cache_creation_tokens, latency_ms, status_code,
-                        created_at, data_source, total_cost_usd
-                     ) VALUES ('original-proxy', 'provider', 'codex', 'gpt-5.6-sol',
-                        1000, 80, 100, 5, 1250, 200, 1800000000, 'proxy', '0.125');",
+                        cache_read_tokens, cache_creation_tokens, latency_ms, first_token_ms,
+                        duration_ms, status_code, created_at, data_source, total_cost_usd,
+                        session_id, input_token_semantics
+                     ) VALUES (?1, 'provider', 'codex', 'gpt-5.6-sol',
+                        1000, 80, 100, 5, ?2, 300, 1250, 200, 1800000000, ?3, '0.125',
+                        'thread-side', ?4)",
+                    rusqlite::params![
+                        target,
+                        original_latency,
+                        data_source,
+                        INPUT_TOKEN_SEMANTICS_TOTAL
+                    ],
                 )?;
             }
             let mut usage_event: SidebarUsageEvent =
@@ -854,9 +1094,9 @@ mod tests {
             let mut pricing = HashMap::new();
             assert_eq!(
                 insert_sidebar_usage_on_conn(&conn, &usage_event, &mut pricing)?,
-                !mapped_proxy
+                is_sidebar
             );
-            if !mapped_proxy {
+            if is_sidebar {
                 conn.execute(
                     "DELETE FROM codex_sidebar_event_map WHERE event_id = ?1",
                     [event_id],
@@ -870,32 +1110,24 @@ mod tests {
                  ) VALUES ('other-proxy', 'provider', 'codex', 'gpt-5.6-sol',
                     1000, 80, 100, 5, 1250, 200, 1800000000, 'proxy', '0.25');",
             )?;
-            let snapshot = || -> Result<(i64, i64, i64, i64, String), AppError> {
-                Ok(conn.query_row(
-                    "SELECT input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-                            total_cost_usd FROM proxy_request_logs WHERE request_id = ?1",
-                    [target],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                        ))
-                    },
-                )?)
-            };
-            let before = snapshot()?;
-            for (reasoning, changed) in [(30, true), (30, false), (5, false)] {
+            let before = billing_snapshot(&conn)?;
+            for (reasoning, estimate, changed) in [
+                (10, Some(800), is_sidebar),
+                (30, Some(1500), true),
+                (30, Some(1500), false),
+                (5, None, false),
+                (5, Some(1800), is_sidebar),
+            ] {
                 usage_event.usage.reasoning_output_tokens = reasoning;
+                usage_event.estimated_latency_ms = estimate;
                 assert_eq!(
                     insert_sidebar_usage_on_conn(&conn, &usage_event, &mut pricing)?,
                     changed
                 );
-                assert_eq!(snapshot()?, before);
+                assert_eq!(billing_snapshot(&conn)?, before);
             }
             usage_event.usage.reasoning_output_tokens = 60;
+            usage_event.estimated_latency_ms = Some(2000);
             usage_event.usage.input_tokens += 1;
             assert!(!insert_sidebar_usage_on_conn(
                 &conn,
@@ -910,6 +1142,20 @@ mod tests {
                 &mut pricing
             )?);
             usage_event.model = "gpt-5.6-sol".into();
+            usage_event.thread_id = "other-thread".into();
+            assert!(!insert_sidebar_usage_on_conn(
+                &conn,
+                &usage_event,
+                &mut pricing
+            )?);
+            usage_event.thread_id = "thread-side".into();
+            usage_event.turn_id = "other-turn".into();
+            assert!(!insert_sidebar_usage_on_conn(
+                &conn,
+                &usage_event,
+                &mut pricing
+            )?);
+            usage_event.turn_id = "turn-side".into();
             let rows: (i64, i64, i64) = conn.query_row(
                 "SELECT COUNT(*), MAX(CASE WHEN request_id = ?1 THEN reasoning_output_tokens END),
                         MAX(CASE WHEN request_id = 'other-proxy' THEN reasoning_output_tokens END)
@@ -918,7 +1164,28 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
             assert_eq!(rows, (2, 30, 0));
-            assert_eq!(snapshot()?, before);
+            assert_eq!(billing_snapshot(&conn)?, before);
+            let timing: (i64, Option<i64>, Option<i64>) = conn.query_row(
+                "SELECT latency_ms, first_token_ms, duration_ms FROM proxy_request_logs
+                 WHERE request_id = ?1",
+                [target],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            assert_eq!(
+                timing,
+                if is_sidebar {
+                    (1800, None, None)
+                } else {
+                    (original_latency, Some(300), Some(1250))
+                }
+            );
+            let mapping: (String, String) = conn.query_row(
+                "SELECT target_request_id, target_data_source FROM codex_sidebar_event_map
+                 WHERE event_id = ?1",
+                [event_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            assert_eq!(mapping, (target.to_string(), data_source.to_string()));
             conn.execute(
                 "DELETE FROM proxy_request_logs WHERE request_id = ?1",
                 [target],
@@ -928,12 +1195,13 @@ mod tests {
                 &usage_event,
                 &mut pricing
             )?);
-            let remaining: (i64, i64) = conn.query_row(
-                "SELECT COUNT(*), MAX(reasoning_output_tokens) FROM proxy_request_logs",
+            let remaining: (i64, i64, i64) = conn.query_row(
+                "SELECT COUNT(*), MAX(reasoning_output_tokens), MAX(latency_ms)
+                 FROM proxy_request_logs",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
-            assert_eq!(remaining, (1, 0));
+            assert_eq!(remaining, (1, 0, 1250));
         }
         Ok(())
     }
@@ -997,20 +1265,24 @@ mod tests {
     }
 
     #[test]
-    fn late_timing_event_updates_only_the_final_sidebar_usage_row() -> Result<(), AppError> {
+    fn late_turn_timing_preserves_each_sidebar_request_estimate() -> Result<(), AppError> {
         let dir = tempdir().unwrap();
         let path = dir.path().join("sidebar.jsonl");
         let first_id = "codex_sidebar:usage-v1:thread-side:turn-side:1";
         let final_id = "codex_sidebar:usage-v1:thread-side:turn-side:2";
-        append_value(&path, &event(first_id, 1000, 80, 40));
-        append_value(&path, &event(final_id, 1200, 90, 50));
+        append_value(&path, &with_estimate(event(first_id, 1000, 80, 40), 1250));
+        append_value(&path, &with_estimate(event(final_id, 1200, 90, 50), 1700));
         let db = Database::memory()?;
         assert_eq!(sync_codex_sidebar_usage_file(&db, &path)?.imported, 2);
+        let before = billing_snapshot(&lock_conn!(db.conn))?;
 
         append_value(&path, &timing_event(final_id, 4_200, 700));
         assert_eq!(sync_codex_sidebar_usage_file(&db, &path)?.imported, 1);
+        append_value(&path, &timing_event(final_id, 4_200, 700));
+        assert_eq!(sync_codex_sidebar_usage_file(&db, &path)?.imported, 0);
 
         let conn = lock_conn!(db.conn);
+        assert_eq!(billing_snapshot(&conn)?, before);
         let rows = conn
             .prepare(
                 "SELECT request_id, latency_ms, first_token_ms, duration_ms
@@ -1030,8 +1302,8 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                (first_id.to_string(), 0, None, None),
-                (final_id.to_string(), 0, Some(700), Some(4_200)),
+                (first_id.to_string(), 1250, None, None),
+                (final_id.to_string(), 1700, Some(700), Some(4_200)),
             ]
         );
         Ok(())
@@ -1059,7 +1331,7 @@ mod tests {
             )?;
         }
 
-        append_value(&path, &event(event_id, 1200, 90, 50));
+        append_value(&path, &with_estimate(event(event_id, 1200, 90, 50), 1700));
         assert_eq!(sync_codex_sidebar_usage_file(&db, &path)?.imported, 0);
         append_value(&path, &timing_event(event_id, 4_200, 700));
         assert_eq!(sync_codex_sidebar_usage_file(&db, &path)?.imported, 1);
@@ -1105,7 +1377,7 @@ mod tests {
             )?;
         }
 
-        append_value(&path, &event(event_id, 1200, 90, 50));
+        append_value(&path, &with_estimate(event(event_id, 1200, 90, 50), 1700));
         assert_eq!(sync_codex_sidebar_usage_file(&db, &path)?.imported, 0);
         append_value(&path, &timing_event(event_id, 4_200, 700));
         assert_eq!(sync_codex_sidebar_usage_file(&db, &path)?.imported, 1);
@@ -1144,7 +1416,7 @@ mod tests {
                     rusqlite::params![cache_write, INPUT_TOKEN_SEMANTICS_TOTAL],
                 )?;
             }
-            append_value(&path, &event(event_id, 1200, 90, 50));
+            append_value(&path, &with_estimate(event(event_id, 1200, 90, 50), 1700));
             let result = sync_codex_sidebar_usage_file(&db, &path)?;
             assert_eq!(result.imported, u32::from(cache_write == 0));
             append_value(&path, &timing_event(event_id, 4200, 700));

@@ -91,6 +91,62 @@ describe("RequestDetailPanel", () => {
     expect(screen.queryByText("usage.detail.firstToken")).toBeNull();
   });
 
+  it.each([undefined, 4_000])(
+    "shows sidebar estimated speed with reasoning warnings without displaying firstTokenMs %s or turn timing",
+    (firstTokenMs) => {
+      renderWith(
+        log({
+          appType: "codex",
+          providerName: "Codex (Sidebar)",
+          dataSource: "codex_sidebar",
+          outputTokens: 1_000,
+          reasoningOutputTokens: 516,
+          latencyMs: 10_000,
+          firstTokenMs,
+          durationMs: 5_208_631,
+        }),
+      );
+
+      expect(
+        screen.getByText("usage.speedEstimatedValue:100"),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/^usage\.speedValue:/)).not.toBeInTheDocument();
+      expect(screen.getByText("516")).toHaveClass("text-danger-text");
+      const latency = screen.getByText("usage.latency").parentElement;
+      expect(latency?.querySelector("dd")).toHaveTextContent(/^—$/);
+      expect(
+        screen.queryByText(
+          /10\.0s|4\.0s|1h 26m|firstToken|duration|whole.?turn/i,
+        ),
+      ).not.toBeInTheDocument();
+    },
+  );
+
+  it("does not use a long sidebar duration when the request has no latency estimate", () => {
+    renderWith(
+      log({
+        appType: "codex",
+        dataSource: "codex_sidebar",
+        outputTokens: 1_000,
+        latencyMs: 0,
+        firstTokenMs: undefined,
+        durationMs: 5_208_631,
+      }),
+    );
+
+    expect(
+      screen.getByText("usage.detail.noTimingSession"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/^usage\.speed(?:Estimated)?Value:/),
+    ).not.toBeInTheDocument();
+    const latency = screen.getByText("usage.latency").parentElement;
+    expect(latency?.querySelector("dd")).toHaveTextContent(/^—$/);
+    expect(
+      screen.queryByText(/0\.0s|1h 26m|firstToken|duration|whole.?turn/i),
+    ).not.toBeInTheDocument();
+  });
+
   it("hides estimated first-token timing even when it is present", () => {
     renderWith(
       log({
@@ -228,9 +284,13 @@ describe("RequestDetailPanel", () => {
   );
 
   it.each([undefined, "", "proxy"])(
-    "keeps proxy latency for source %s",
+    "keeps measured proxy speed and latency for source %s",
     (dataSource) => {
       renderWith(log({ dataSource, durationMs: 5_208_631 }));
+      expect(screen.getByText("usage.speedValue:65")).toBeInTheDocument();
+      expect(
+        screen.queryByText(/^usage\.speedEstimatedValue:/),
+      ).not.toBeInTheDocument();
       expect(screen.getByText("26.4s")).toBeInTheDocument();
       expect(
         screen.queryByText(/3\.2s|5208|firstToken|duration/i),

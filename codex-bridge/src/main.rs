@@ -14,6 +14,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+mod request_timer;
+use request_timer::RequestTimer;
+
 const REAL_CLI_PATH_ENV: &str = "CC_SWITCH_CODEX_REAL_CLI_PATH";
 const USAGE_PATH_ENV: &str = "CC_SWITCH_CODEX_SIDEBAR_USAGE_PATH";
 const USAGE_FILE: &str = "codex-sidebar-usage.jsonl";
@@ -175,6 +178,7 @@ struct TurnInfo {
     started_at: Instant,
     first_token_ms: Option<u64>,
     timing_emitted: bool,
+    request_timer: RequestTimer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,6 +254,8 @@ struct UsageRecord {
     model: String,
     completed_at_ms: i64,
     usage: UsageBreakdown,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    estimated_latency_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -331,6 +337,7 @@ impl BridgeState {
         }
 
         let method = value.get("method").and_then(Value::as_str)?;
+        self.observe_request_timing(value, method);
         match method {
             "thread/started" => self.observe_thread_started(value),
             "thread/settings/updated" => self.observe_thread_settings(value),
@@ -406,6 +413,7 @@ impl BridgeState {
                         started_at,
                         first_token_ms: None,
                         timing_emitted: false,
+                        request_timer: RequestTimer::default(),
                     });
             }
         }
@@ -466,9 +474,6 @@ impl BridgeState {
         self.turns
             .entry(turn_id.to_owned())
             .and_modify(|turn| {
-                if turn.sequence == 0 && turn.first_token_ms.is_none() {
-                    turn.started_at = Instant::now();
-                }
                 turn.thread_id = thread_id.to_owned();
                 turn.model = model.clone();
             })
@@ -481,7 +486,55 @@ impl BridgeState {
                 started_at: Instant::now(),
                 first_token_ms: None,
                 timing_emitted: false,
+                request_timer: RequestTimer::default(),
             });
+    }
+
+    fn observe_request_timing(&mut self, value: &Value, method: &str) {
+        let Some(thread_id) = value.pointer("/params/threadId").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(turn_id) = value.pointer("/params/turnId").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(turn) = self.turns.get_mut(turn_id) else {
+            return;
+        };
+        if turn.thread_id != thread_id {
+            return;
+        }
+        let at_ms = turn.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        match method {
+            "item/started" | "item/completed" => {
+                let Some(item) = value.pointer("/params/item") else {
+                    return;
+                };
+                let Some(kind) = item.get("type").and_then(Value::as_str) else {
+                    return;
+                };
+                let Some(id) = item.get("id").and_then(Value::as_str) else {
+                    return;
+                };
+                turn.request_timer
+                    .item(kind, id, method == "item/completed", at_ms);
+            }
+            "item/agentMessage/delta"
+            | "item/reasoning/summaryTextDelta"
+            | "item/reasoning/textDelta"
+            | "item/plan/delta" => {
+                if value
+                    .pointer("/params/delta")
+                    .and_then(Value::as_str)
+                    .is_some_and(|delta| !delta.is_empty())
+                {
+                    if let Some(id) = value.pointer("/params/itemId").and_then(Value::as_str) {
+                        turn.request_timer.model_output(id, at_ms);
+                    }
+                }
+            }
+            "error" => turn.request_timer.invalidate(),
+            _ => {}
+        }
     }
 
     fn observe_agent_message_delta(&mut self, value: &Value) {
@@ -600,6 +653,9 @@ impl BridgeState {
             model: turn.model.clone(),
             completed_at_ms,
             usage: last,
+            estimated_latency_ms: turn
+                .request_timer
+                .finish(turn.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64),
         };
         turn.last_usage = Some(record.clone());
         Some(record)
@@ -925,6 +981,46 @@ mod tests {
         }));
         start_turn(&mut state);
         assert!(state.observe_server_message(&usage(6000, 80, 40)).is_none());
+    }
+
+    #[test]
+    fn sampling_estimate_is_serialized_without_text_and_survives_metadata_replay() {
+        let mut state = BridgeState::default();
+        fork_side_thread(&mut state);
+        start_turn(&mut state);
+        state.turns.get_mut("turn-1").unwrap().started_at =
+            Instant::now() - std::time::Duration::from_secs(10);
+        state.observe_server_message(&serde_json::json!({
+            "method": "item/agentMessage/delta",
+            "params": {"threadId": "side", "turnId": "turn-1", "itemId": "m1", "delta": "private text"}
+        }));
+        let first = expect_usage(state.observe_server_message(&usage(6000, 800, 0)).unwrap());
+        assert!(first.estimated_latency_ms.is_some_and(|ms| ms >= 10_000));
+        let encoded = serde_json::to_string(&first).unwrap();
+        assert!(encoded.contains("estimatedLatencyMs"));
+        assert!(!encoded.contains("private text"));
+        let enriched = expect_usage(
+            state
+                .observe_server_message(&usage(6000, 800, 516))
+                .unwrap(),
+        );
+        assert_eq!(first.event_id, enriched.event_id);
+        assert_eq!(first.estimated_latency_ms, enriched.estimated_latency_ms);
+        assert!(state
+            .observe_server_message(&usage(6000, 800, 516))
+            .is_none());
+    }
+
+    #[test]
+    fn legacy_or_unobserved_usage_does_not_fabricate_request_timing() {
+        let mut state = BridgeState::default();
+        fork_side_thread(&mut state);
+        start_turn(&mut state);
+        let record = expect_usage(state.observe_server_message(&usage(6000, 800, 0)).unwrap());
+        assert_eq!(record.estimated_latency_ms, None);
+        assert!(!serde_json::to_string(&record)
+            .unwrap()
+            .contains("estimatedLatencyMs"));
     }
 
     #[test]

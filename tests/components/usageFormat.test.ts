@@ -215,6 +215,64 @@ describe("usage format helpers", () => {
     });
   });
 
+  it.each([undefined, 4_000])(
+    "estimates sidebar speed from request latency without subtracting firstTokenMs %s",
+    (firstTokenMs) => {
+      const sidebar = {
+        dataSource: "codex_sidebar",
+        outputTokens: 1_000,
+        latencyMs: 10_000,
+        firstTokenMs,
+        durationMs: 5_208_631,
+      };
+
+      expect(getEstimatedTokensPerSecond(sidebar)).toBe(100);
+      expect(formatEstimatedTokensPerSecond(sidebar)).toBe("100");
+      expect(formatOutputTokensPerSecond(sidebar)).toBeNull();
+      expect(formatRequestLatency(sidebar)).toBe("—");
+      expect(sumSpeedTotals([sidebar])).toEqual({
+        outputTokens: 0,
+        generationMs: 0,
+      });
+    },
+  );
+
+  it.each([0, undefined, null, -1, NaN, Infinity])(
+    "does not fall back to sidebar durationMs when latencyMs is %s",
+    (latencyMs) => {
+      const sidebar = {
+        dataSource: "codex_sidebar",
+        outputTokens: 1_000,
+        latencyMs,
+        durationMs: 5_208_631,
+      };
+
+      expect(getEstimatedTokensPerSecond(sidebar)).toBeNull();
+      expect(formatEstimatedTokensPerSecond(sidebar)).toBeNull();
+      expect(formatOutputTokensPerSecond(sidebar)).toBeNull();
+      expect(formatRequestLatency(sidebar)).toBe("—");
+    },
+  );
+
+  it("keeps sidebar estimates out of measured proxy speed totals", () => {
+    const proxy = {
+      dataSource: "proxy",
+      outputTokens: 1_000,
+      latencyMs: 10_000,
+      firstTokenMs: 4_000,
+      durationMs: 5_208_631,
+    };
+    const sidebar = { ...proxy, dataSource: "codex_sidebar" };
+
+    expect(formatOutputTokensPerSecond(proxy)).toBe("167");
+    expect(getEstimatedTokensPerSecond(proxy)).toBeNull();
+    expect(formatEstimatedTokensPerSecond(sidebar)).toBe("100");
+    expect(sumSpeedTotals([proxy, sidebar])).toEqual({
+      outputTokens: 1_000,
+      generationMs: 6_000,
+    });
+  });
+
   it("formats first-token time in seconds", () => {
     expect(formatFirstTokenSeconds(2_640)).toBe("2.6s");
     expect(formatFirstTokenSeconds(0)).toBe("0.0s");
