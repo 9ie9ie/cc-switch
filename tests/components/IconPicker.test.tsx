@@ -106,7 +106,10 @@ describe("IconPicker my icons", () => {
     const onValueChange = vi.fn();
     renderPicker({ value: OTHER, onValueChange });
 
-    fireEvent.click(await screen.findByRole("button", { name: "Relay A" }));
+    // findByRole defaults to 1s, independently of Vitest's test timeout.
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Relay A" }, { timeout: 5_000 }),
+    );
     expect(onValueChange).toHaveBeenCalledWith(CUSTOM);
     // 当前图标就在库里，不再单独显示「当前图标」
     expect(

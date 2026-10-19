@@ -1012,7 +1012,7 @@ mod tests {
         assert_eq!(sync_codex_sidebar_usage_file(&db, &path)?.imported, 1);
         append_value(&path, &timing_event(event_id, 4200, 700));
         assert_eq!(sync_codex_sidebar_usage_file(&db, &path)?.imported, 1);
-        let before = billing_snapshot(&lock_conn!(db.conn))?;
+        let before = billing_snapshot(&*lock_conn!(db.conn))?;
         let mut offset = get_sync_state(&db, &path.to_string_lossy())?.1;
         for (estimate, reasoning, imported) in [
             (Some(1250), 10, 1),
@@ -1274,7 +1274,7 @@ mod tests {
         append_value(&path, &with_estimate(event(final_id, 1200, 90, 50), 1700));
         let db = Database::memory()?;
         assert_eq!(sync_codex_sidebar_usage_file(&db, &path)?.imported, 2);
-        let before = billing_snapshot(&lock_conn!(db.conn))?;
+        let before = billing_snapshot(&*lock_conn!(db.conn))?;
 
         append_value(&path, &timing_event(final_id, 4_200, 700));
         assert_eq!(sync_codex_sidebar_usage_file(&db, &path)?.imported, 1);
