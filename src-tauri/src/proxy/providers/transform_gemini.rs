@@ -1230,6 +1230,9 @@ pub(crate) fn build_anthropic_usage(usage: Option<&Value>) -> Value {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens
     });
+    if let Some(reasoning) = usage.get("thoughtsTokenCount").and_then(Value::as_u64) {
+        result["reasoning_output_tokens"] = json!(reasoning);
+    }
 
     if cached_tokens > 0 {
         result["cache_read_input_tokens"] = json!(cached_tokens);

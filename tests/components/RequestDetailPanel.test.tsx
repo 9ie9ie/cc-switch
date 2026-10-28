@@ -1,4 +1,5 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, screen } from "@testing-library/react";
+import { renderWithQueryClient as render } from "../utils/testQueryClient";
 import { describe, expect, it, vi } from "vitest";
 import { RequestDetailPanel } from "@/components/usage/RequestDetailPanel";
 import type { RequestLog } from "@/types/usage";
@@ -147,25 +148,49 @@ describe("RequestDetailPanel", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("hides estimated first-token timing even when it is present", () => {
+  it.each(["codex_session", "kimi_session"])(
+    "keeps estimated speed but hides available first-token timing for %s",
+    (dataSource) => {
+      renderWith(
+        log({
+          dataSource,
+          firstTokenMs: 3_300,
+          outputTokens: 1_800,
+          latencyMs: 20_000,
+        }),
+      );
+
+      expect(
+        screen.getByText("usage.speedEstimatedValue:90"),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByText(/3\.3s|20\.0s|firstToken|duration/i),
+      ).not.toBeInTheDocument();
+    },
+  );
+
+  it("shows Kimi's actual model and keeps the short-output speed threshold without timing", () => {
     renderWith(
       log({
-        dataSource: "codex_session",
-        firstTokenMs: 3_300,
-        outputTokens: 1_800,
-        latencyMs: 20_000,
+        appType: "kimi",
+        providerId: "_kimi_session",
+        providerName: "Kimi Code (Session)",
+        dataSource: "kimi_session",
+        model: "agnes-3.0-flash",
+        firstTokenMs: 10_061,
+        latencyMs: 10_228,
+        outputTokens: 2,
       }),
     );
-
+    expect(screen.getByText("agnes-3.0-flash")).toBeInTheDocument();
     expect(
       screen.queryByText("usage.detail.firstTokenEstimated"),
     ).not.toBeInTheDocument();
-    expect(screen.queryByText("3.3s")).not.toBeInTheDocument();
-    // 速度仍按整段耗时估
+    expect(screen.queryByText("10.1s")).not.toBeInTheDocument();
+    expect(screen.queryByText("10.2s")).not.toBeInTheDocument();
     expect(
-      screen.getByText("usage.speedEstimatedValue:90"),
+      screen.getByText("usage.detail.speedEstimateTooFew"),
     ).toBeInTheDocument();
-    expect(screen.queryByText("usage.detail.firstToken")).toBeNull();
   });
 
   it("explains why short session-log outputs have no estimate", () => {
@@ -196,7 +221,11 @@ describe("RequestDetailPanel", () => {
     expect(
       screen.getByText("usage.detail.noTimingSession"),
     ).toBeInTheDocument();
-    expect(screen.getByText("usage.detail.sourceSession")).toBeInTheDocument();
+    // 供应商已经叫「会话日志」：不再重复列来源和内部的供应商 ID
+    expect(screen.queryByText("usage.detail.source")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("usage.detail.providerId"),
+    ).not.toBeInTheDocument();
   });
 
   it("shows the error and a retry button when loading fails", () => {
@@ -256,6 +285,23 @@ describe("RequestDetailPanel", () => {
   );
 
   it.each([
+    ["claude", "claude-opus-5-5"],
+    ["codex", "gpt-5.6-sol"],
+    ["gemini", "gemini-3-pro"],
+    ["grokbuild", "grok-4"],
+    ["opencode", "qwen3"],
+    ["pi", "kimi-k2.6"],
+    ["mcode", "MiniMax-M2.7"],
+    ["kimi", "agnes-3.0-flash"],
+    ["agy", "claude-opus-4-6-thinking"],
+    ["omp", "gpt-5.6-sol"],
+  ])("shows reasoning tokens for %s / %s", (appType, model) => {
+    renderWith(log({ appType, model, reasoningOutputTokens: 516 }));
+    expect(screen.getByText("516")).toHaveClass("text-danger-text");
+    expect(screen.getByText("usage.reasoningOutputTokens")).toBeInTheDocument();
+  });
+
+  it.each([
     "session_log",
     "codex_session",
     "codex_sidebar",
@@ -264,6 +310,9 @@ describe("RequestDetailPanel", () => {
     "pi_session",
     "grokbuild_session",
     "mcode_session",
+    "kimi_session",
+    "agy_session",
+    "omp_session",
     "local",
   ])(
     "shows a dash for %s latency and hides first-token/turn values",

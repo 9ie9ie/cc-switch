@@ -6,6 +6,7 @@
 //! - Codex API (非流式和流式)
 //! - Gemini API (非流式和流式)
 
+use crate::proxy::providers::transform::chat_completion_body;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -119,6 +120,12 @@ impl TokenUsage {
 
 impl TokenUsage {
     pub(crate) fn reasoning_output_tokens_from_usage(usage: &Value) -> u32 {
+        Self::reported_reasoning_output_tokens(usage)
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32
+    }
+
+    pub(crate) fn reported_reasoning_output_tokens(usage: &Value) -> Option<u64> {
         usage
             .get("reasoning_output_tokens")
             .and_then(Value::as_u64)
@@ -141,7 +148,6 @@ impl TokenUsage {
                     .pointer("/output_tokens_details/thinking_tokens")
                     .and_then(Value::as_u64)
             })
-            .unwrap_or(0) as u32
     }
 
     /// 从 Claude API 非流式响应解析
@@ -352,6 +358,8 @@ impl TokenUsage {
     ///
     /// 注意：记录原始 input_tokens，费用计算时再减去 cached_tokens
     pub fn from_codex_response_auto(body: &Value) -> Option<Self> {
+        let body = chat_completion_body(body);
+        let body = body.as_ref();
         let usage = body.get("usage")?;
 
         // 检测格式：OpenAI 使用 prompt_tokens，Codex 使用 input_tokens
@@ -405,6 +413,9 @@ impl TokenUsage {
 
     /// 从 OpenAI Chat Completions API 响应解析 (prompt_tokens, completion_tokens)
     pub fn from_openai_response(body: &Value) -> Option<Self> {
+        // 包在 `data` 里的 Chat 响应（#5658）按解包后的字段取 usage / model / id
+        let body = chat_completion_body(body);
+        let body = body.as_ref();
         let usage = body.get("usage")?;
 
         // OpenAI 使用 prompt_tokens 和 completion_tokens
@@ -562,6 +573,181 @@ impl TokenUsage {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    async fn converted_sse_events(
+        stream: impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>>,
+    ) -> Vec<Value> {
+        use futures::StreamExt;
+
+        let chunks = stream.collect::<Vec<_>>().await;
+        let text = chunks
+            .into_iter()
+            .map(|chunk| String::from_utf8(chunk.unwrap().to_vec()).unwrap())
+            .collect::<String>();
+        text.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str(data).ok())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn reported_reasoning_survives_chat_conversions_without_changing_output() {
+        use crate::proxy::providers::{streaming, transform, transform_codex_chat};
+
+        for (extra, reasoning) in [
+            (json!({}), None),
+            (json!({"reasoning_output_tokens": 0}), Some(0)),
+            (json!({"reasoning_output_tokens": 17}), Some(17)),
+            (json!({"reasoning_tokens": 17}), Some(17)),
+            (json!({"reasoningTokens": 17}), Some(17)),
+            (
+                json!({"output_tokens_details": {"reasoning_tokens": 17}}),
+                Some(17),
+            ),
+            (
+                json!({"output_tokens_details": {"thinking_tokens": 17}}),
+                Some(17),
+            ),
+            (
+                json!({"completion_tokens_details": {"reasoning_tokens": 17, "audio_tokens": 3}}),
+                Some(17),
+            ),
+        ] {
+            let mut usage = json!({
+                "prompt_tokens": 100, "completion_tokens": 80,
+                "prompt_tokens_details": {"cached_tokens": 20, "cache_write_tokens": 5}
+            });
+            usage
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let response = json!({
+                "id": "chat-reasoning", "model": "test-model",
+                "choices": [{"message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}],
+                "usage": usage
+            });
+            let wrapped = json!({"success": true, "data": response});
+            let raw = TokenUsage::from_codex_response_auto(&wrapped).unwrap();
+            assert_eq!(
+                (
+                    raw.input_tokens,
+                    raw.output_tokens,
+                    raw.reasoning_output_tokens
+                ),
+                (100, 80, reasoning.unwrap_or(0))
+            );
+
+            let converted = transform::openai_to_anthropic(wrapped).unwrap();
+            assert_eq!(
+                converted["usage"].get("reasoning_output_tokens"),
+                reasoning.map(|v| json!(v)).as_ref()
+            );
+            let parsed = TokenUsage::from_claude_response(&converted).unwrap();
+            assert_eq!(
+                (
+                    parsed.input_tokens,
+                    parsed.output_tokens,
+                    parsed.cache_read_tokens,
+                    parsed.cache_creation_tokens
+                ),
+                (75, 80, 20, 5)
+            );
+            assert_eq!(parsed.reasoning_output_tokens, reasoning.unwrap_or(0));
+
+            let converted = transform_codex_chat::chat_usage_to_responses_usage(Some(&usage));
+            assert_eq!(
+                converted["output_tokens_details"]["reasoning_tokens"],
+                reasoning.unwrap_or(0)
+            );
+            assert_eq!(converted["output_tokens"], 80);
+            if usage
+                .pointer("/completion_tokens_details/audio_tokens")
+                .is_some()
+            {
+                assert_eq!(converted["output_tokens_details"]["audio_tokens"], 3);
+            }
+
+            let input = format!(
+                "data: {{\"id\":\"chat-reasoning\",\"model\":\"test-model\",\"choices\":[{{\"delta\":{{\"content\":\"OK\"}},\"finish_reason\":\"stop\"}}]}}\n\n\
+                 data: {{\"choices\":[],\"usage\":{usage}}}\n\ndata: [DONE]\n\n"
+            );
+            let upstream =
+                futures::stream::iter(vec![Ok::<_, std::io::Error>(bytes::Bytes::from(input))]);
+            let events =
+                converted_sse_events(streaming::create_anthropic_sse_stream(upstream)).await;
+            let parsed = TokenUsage::from_claude_stream_events(&events).unwrap();
+            assert_eq!(
+                (
+                    parsed.input_tokens,
+                    parsed.output_tokens,
+                    parsed.reasoning_output_tokens
+                ),
+                (75, 80, reasoning.unwrap_or(0))
+            );
+            let terminal = events
+                .iter()
+                .find(|event| event["type"] == "message_delta")
+                .unwrap();
+            assert_eq!(
+                terminal["usage"].get("reasoning_output_tokens"),
+                reasoning.map(|v| json!(v)).as_ref()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reported_gemini_thoughts_survive_both_anthropic_paths() {
+        use crate::proxy::providers::{streaming_gemini, transform_gemini};
+
+        for reasoning in [None, Some(0), Some(17)] {
+            let mut usage = json!({
+                "promptTokenCount": 100, "totalTokenCount": 180,
+                "cachedContentTokenCount": 20
+            });
+            if let Some(reasoning) = reasoning {
+                usage["thoughtsTokenCount"] = json!(reasoning);
+            }
+            let response = json!({
+                "responseId": "gemini-reasoning", "modelVersion": "test-model",
+                "candidates": [{"content": {"parts": [{"text": "OK"}]}, "finishReason": "STOP"}],
+                "usageMetadata": usage
+            });
+            let converted = transform_gemini::gemini_to_anthropic(response.clone()).unwrap();
+            assert_eq!(
+                converted["usage"].get("reasoning_output_tokens"),
+                reasoning.map(|v| json!(v)).as_ref()
+            );
+            let parsed = TokenUsage::from_claude_response(&converted).unwrap();
+            assert_eq!(
+                (
+                    parsed.input_tokens,
+                    parsed.output_tokens,
+                    parsed.reasoning_output_tokens,
+                    parsed.cache_read_tokens
+                ),
+                (80, 80, reasoning.unwrap_or(0), 20)
+            );
+
+            let upstream = futures::stream::iter(vec![Ok::<_, std::io::Error>(
+                bytes::Bytes::from(format!("data: {response}\n\n")),
+            )]);
+            let events =
+                converted_sse_events(streaming_gemini::create_anthropic_sse_stream_from_gemini(
+                    upstream, None, None, None, None,
+                ))
+                .await;
+            let parsed = TokenUsage::from_claude_stream_events(&events).unwrap();
+            assert_eq!(
+                (
+                    parsed.input_tokens,
+                    parsed.output_tokens,
+                    parsed.reasoning_output_tokens,
+                    parsed.cache_read_tokens
+                ),
+                (80, 80, reasoning.unwrap_or(0), 20)
+            );
+        }
+    }
 
     #[test]
     fn response_ids_produce_scoped_dedup_keys_and_empty_ids_fall_back() {
@@ -1266,6 +1452,33 @@ mod tests {
         assert_eq!(usage.output_tokens, 500);
         assert_eq!(usage.cache_read_tokens, 200);
         assert_eq!(usage.model, Some("gpt-4o".to_string()));
+    }
+
+    #[test]
+    fn test_openai_response_reads_data_envelope() {
+        // #5658：包在 data 里的 Chat 响应也要记账
+        let body = json!({
+            "success": true,
+            "data": {
+                "id": "chatcmpl-wrapped",
+                "model": "cline-pass/deepseek-v4.1-flash",
+                "choices": [{"message": {"role": "assistant", "content": "OK"}}],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 1}
+            }
+        });
+
+        for usage in [
+            TokenUsage::from_openai_response(&body).unwrap(),
+            TokenUsage::from_codex_response_auto(&body).unwrap(),
+        ] {
+            assert_eq!(usage.input_tokens, 12);
+            assert_eq!(usage.output_tokens, 1);
+            assert_eq!(
+                usage.model.as_deref(),
+                Some("cline-pass/deepseek-v4.1-flash")
+            );
+            assert_eq!(usage.message_id.as_deref(), Some("chatcmpl-wrapped"));
+        }
     }
 
     #[test]

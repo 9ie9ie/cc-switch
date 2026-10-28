@@ -559,17 +559,17 @@ mod tests {
             conn.execute(
                 "INSERT INTO usage_daily_rollups
                     (date, app_type, provider_id, model, request_count, success_count,
-                     input_tokens, output_tokens, total_cost_usd, avg_latency_ms)
-                 VALUES (?1, 'claude', 'p1', 'claude-3', 10, 10, 1000, 500, '0.10', 100)",
+                     input_tokens, output_tokens, reasoning_output_tokens, total_cost_usd, avg_latency_ms)
+                 VALUES (?1, 'claude', 'p1', 'claude-3', 10, 10, 1000, 500, 37, '0.10', 100)",
                 [&date_str],
             )?;
             for i in 0..3 {
                 conn.execute(
                     "INSERT INTO proxy_request_logs (
                         request_id, provider_id, app_type, model,
-                        input_tokens, output_tokens, total_cost_usd,
+                        input_tokens, output_tokens, reasoning_output_tokens, total_cost_usd,
                         latency_ms, status_code, created_at
-                    ) VALUES (?1, 'p1', 'claude', 'claude-3', 100, 50, '0.01', 200, 200, ?2)",
+                    ) VALUES (?1, 'p1', 'claude', 'claude-3', 100, 50, 10, '0.01', 200, 200, ?2)",
                     rusqlite::params![format!("merge-{i}"), old_ts + i as i64],
                 )?;
             }
@@ -587,6 +587,14 @@ mod tests {
         )?;
         assert_eq!(count, 13, "10 existing + 3 new");
         assert_eq!(input, 1300, "1000 existing + 300 new");
+        let (output, reasoning, cost): (i64, i64, f64) = conn.query_row(
+            "SELECT output_tokens, reasoning_output_tokens, CAST(total_cost_usd AS REAL)
+             FROM usage_daily_rollups WHERE app_type = 'claude' AND provider_id = 'p1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!((output, reasoning), (650, 67));
+        assert!((cost - 0.13).abs() < 1e-10);
         Ok(())
     }
 }

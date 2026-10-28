@@ -34,12 +34,14 @@ export function getStatsEstimatedSpeed(stat: SpeedTotals): string | null {
   );
 }
 
-/** 「成功率」「速度」两列的表头，供应商和模型统计共用。 */
+/** 「成功率」「速度」两列的表头，供应商和模型统计共用；成功率前面多留组间距。 */
 export function PerformanceHeaders() {
   const { t } = useTranslation();
   return (
     <>
-      <th className={usageTable.th}>{t("usage.successRate")}</th>
+      <th className={cn(usageTable.th, usageTable.groupGap)}>
+        {t("usage.successRate")}
+      </th>
       <th className={usageTable.th}>
         <span className="inline-flex items-center gap-0.5">
           {t("usage.speed")}
@@ -64,7 +66,7 @@ export function PerformanceCells({
   const speed = exactSpeed ?? estimatedSpeed;
   return (
     <>
-      <td className={usageTable.td}>
+      <td className={cn(usageTable.td, usageTable.groupGap)}>
         {stat.successRate.toFixed(stat.successRate >= 99.95 ? 0 : 1)}%
       </td>
       <td className={cn(usageTable.td, speed == null && usageTable.muted)}>
